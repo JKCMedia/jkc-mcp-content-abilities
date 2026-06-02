@@ -1,7 +1,7 @@
 === JKC MCP Content Abilities ===
 Contributors: jkcmedia
 Requires PHP: 7.4
-Stable tag: 1.4.0
+Stable tag: 1.5.0
 License: GPLv2 or later
 
 Stelt lees-, audit- en schrijf-abilities beschikbaar aan de WordPress MCP Adapter,
@@ -34,6 +34,8 @@ Werkt voor pagina's (type "page", standaard) en berichten (type "post").
 Alle abilities zijn meta.mcp.public = true en verschijnen op de default server.
 
 == Changelog ==
+= 1.5.0 =
+* Posts/pagina's inplannen: create-content en update-content accepteren publish_date (toekomstige datum/tijd = ingepland).
 = 1.4.0 =
 * Automatische updates via GitHub: WordPress meldt voortaan een update zodra er een nieuwe versie op de repo staat.
 = 1.3.0 =

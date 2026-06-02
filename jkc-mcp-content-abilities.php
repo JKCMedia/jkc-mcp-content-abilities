@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.4.0
+ * Version:           1.5.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -207,6 +207,27 @@ function jkc_mcp_resolve_post( array $input ) {
 
 function jkc_mcp_publish_cap( $type ) {
     return ( 'post' === $type ) ? 'publish_posts' : 'publish_pages';
+}
+
+/**
+ * Bereken post_date-velden voor een geplande of gedateerde publicatie.
+ *
+ * @param string $publish_date Datum/tijd in sitetijd, bijv. "2026-06-10 09:00".
+ * @return array|WP_Error array met post_date, post_date_gmt en is_future, of WP_Error.
+ */
+function jkc_mcp_schedule_fields( $publish_date ) {
+    try {
+        $dt = new DateTime( (string) $publish_date, wp_timezone() );
+    } catch ( Exception $e ) {
+        return new WP_Error( 'invalid_date', __( 'Ongeldige datum/tijd. Gebruik bijvoorbeeld "2026-06-10 09:00".', 'jkc-mcp' ), array( 'status' => 400 ) );
+    }
+    $utc = clone $dt;
+    $utc->setTimezone( new DateTimeZone( 'UTC' ) );
+    return array(
+        'post_date'     => $dt->format( 'Y-m-d H:i:s' ),
+        'post_date_gmt' => $utc->format( 'Y-m-d H:i:s' ),
+        'is_future'     => $dt->getTimestamp() > time(),
+    );
 }
 
 /**
@@ -605,7 +626,7 @@ function jkc_mcp_register_abilities() {
         'jkc/update-content',
         array(
             'label'         => __( 'Update Content', 'jkc-mcp' ),
-            'description'   => __( 'Updates the title, content and/or status of an existing page or post. Publishing requires publish rights.', 'jkc-mcp' ),
+            'description'   => __( 'Updates the title, content, status and/or scheduled publish date of an existing page or post. Use publish_date to schedule. Publishing requires publish rights.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -619,6 +640,10 @@ function jkc_mcp_register_abilities() {
                         'type'        => 'string',
                         'enum'        => array( 'draft', 'pending', 'private', 'publish' ),
                         'description' => 'New status (optional).',
+                    ),
+                    'publish_date' => array(
+                        'type'        => 'string',
+                        'description' => 'Optioneel: plan publicatie op deze datum/tijd in sitetijd (bijv. "2026-06-10 09:00"). Toekomstige tijd = ingepland (status future).',
                     ),
                 ),
             ),
@@ -655,6 +680,19 @@ function jkc_mcp_register_abilities() {
                         return new WP_Error( 'forbidden', __( 'You cannot publish this content.', 'jkc-mcp' ), array( 'status' => 403 ) );
                     }
                     $update['post_status'] = $status;
+                }
+
+                if ( ! empty( $input['publish_date'] ) ) {
+                    $sched = jkc_mcp_schedule_fields( $input['publish_date'] );
+                    if ( is_wp_error( $sched ) ) {
+                        return $sched;
+                    }
+                    if ( ! current_user_can( jkc_mcp_publish_cap( $post->post_type ) ) ) {
+                        return new WP_Error( 'forbidden', __( 'You cannot schedule/publish this content.', 'jkc-mcp' ), array( 'status' => 403 ) );
+                    }
+                    $update['post_date']     = $sched['post_date'];
+                    $update['post_date_gmt'] = $sched['post_date_gmt'];
+                    $update['post_status']   = $sched['is_future'] ? 'future' : 'publish';
                 }
 
                 $result = wp_update_post( $update, true );
@@ -746,7 +784,7 @@ function jkc_mcp_register_abilities() {
         'jkc/create-content',
         array(
             'label'         => __( 'Create Content', 'jkc-mcp' ),
-            'description'   => __( 'Creates a new page or post with a title, content and status. Publishing requires publish rights.', 'jkc-mcp' ),
+            'description'   => __( 'Creates a new page or post. Use publish_date to schedule it for a future date/time (status becomes future). Publishing requires publish rights.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -758,6 +796,10 @@ function jkc_mcp_register_abilities() {
                         'type'        => 'string',
                         'enum'        => array( 'draft', 'pending', 'private', 'publish' ),
                         'description' => 'Status, defaults to draft.',
+                    ),
+                    'publish_date' => array(
+                        'type'        => 'string',
+                        'description' => 'Optioneel: plan publicatie op deze datum/tijd in sitetijd (bijv. "2026-06-10 09:00"). Toekomstige tijd = ingepland (status future).',
                     ),
                 ),
                 'required'   => array( 'title' ),
@@ -783,15 +825,27 @@ function jkc_mcp_register_abilities() {
                     return new WP_Error( 'forbidden', __( 'You cannot publish this content.', 'jkc-mcp' ), array( 'status' => 403 ) );
                 }
 
-                $result = wp_insert_post(
-                    array(
-                        'post_type'    => $type,
-                        'post_title'   => sanitize_text_field( $input['title'] ),
-                        'post_content' => isset( $input['content'] ) ? $input['content'] : '',
-                        'post_status'  => $status,
-                    ),
-                    true
+                $postarr = array(
+                    'post_type'    => $type,
+                    'post_title'   => sanitize_text_field( $input['title'] ),
+                    'post_content' => isset( $input['content'] ) ? $input['content'] : '',
+                    'post_status'  => $status,
                 );
+
+                if ( ! empty( $input['publish_date'] ) ) {
+                    $sched = jkc_mcp_schedule_fields( $input['publish_date'] );
+                    if ( is_wp_error( $sched ) ) {
+                        return $sched;
+                    }
+                    if ( ! current_user_can( jkc_mcp_publish_cap( $type ) ) ) {
+                        return new WP_Error( 'forbidden', __( 'You cannot schedule/publish this content.', 'jkc-mcp' ), array( 'status' => 403 ) );
+                    }
+                    $postarr['post_date']     = $sched['post_date'];
+                    $postarr['post_date_gmt'] = $sched['post_date_gmt'];
+                    $postarr['post_status']   = $sched['is_future'] ? 'future' : 'publish';
+                }
+
+                $result = wp_insert_post( $postarr, true );
                 if ( is_wp_error( $result ) ) {
                     return $result;
                 }
