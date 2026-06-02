@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.5.0
+ * Version:           1.6.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -610,6 +610,105 @@ function jkc_mcp_register_abilities() {
                     return $post;
                 }
                 return jkc_mcp_build_seo_audit( $post );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array(
+                'annotations' => array( 'readonly' => true, 'destructive' => false ),
+                'mcp'         => array( 'public' => true ),
+            ),
+        )
+    );
+
+    /* ---- READ: bulk SEO audit (hele site snel scannen) --------------- */
+    wp_register_ability(
+        'jkc/bulk-seo-audit',
+        array(
+            'label'         => __( 'Bulk SEO Audit', 'jkc-mcp' ),
+            'description'   => __( 'Scans all pages or posts and returns a prioritised list of SEO issues per item (missing meta description, missing focus keyphrase, missing featured image, no-index, meta length off). Lightweight site-wide check; use jkc/seo-audit for a deep single-page analysis.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'type'  => $type_prop,
+                    'limit' => array( 'type' => 'integer', 'description' => 'Max items (default 200).' ),
+                ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $type  = isset( $input['type'] ) && in_array( $input['type'], jkc_mcp_allowed_types(), true )
+                    ? $input['type']
+                    : 'page';
+                $limit = isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 500 ) ) : 200;
+
+                $all = get_posts(
+                    array(
+                        'post_type'        => $type,
+                        'post_status'      => array( 'publish', 'draft', 'pending', 'private' ),
+                        'numberposts'      => $limit,
+                        'orderby'          => 'title',
+                        'order'            => 'ASC',
+                        'suppress_filters' => false,
+                    )
+                );
+
+                $site_indexable = ( '1' === (string) get_option( 'blog_public' ) );
+                $items   = array();
+                $summary = array(
+                    'no_meta_description' => 0,
+                    'meta_length_off'     => 0,
+                    'no_focus_keyphrase'  => 0,
+                    'no_featured_image'   => 0,
+                    'page_noindex'        => 0,
+                );
+
+                foreach ( $all as $p ) {
+                    $md      = (string) get_post_meta( $p->ID, '_yoast_wpseo_metadesc', true );
+                    $kw      = (string) get_post_meta( $p->ID, '_yoast_wpseo_focuskw', true );
+                    $thumb   = get_post_thumbnail_id( $p->ID );
+                    $noindex = ( '1' === (string) get_post_meta( $p->ID, '_yoast_wpseo_meta-robots-noindex', true ) );
+
+                    $issues = array();
+                    if ( '' === $md ) {
+                        $issues[] = 'geen meta description';
+                        $summary['no_meta_description']++;
+                    } elseif ( strlen( $md ) < 120 || strlen( $md ) > 156 ) {
+                        $issues[] = sprintf( 'meta description %d tekens (ideaal 120-156)', strlen( $md ) );
+                        $summary['meta_length_off']++;
+                    }
+                    if ( '' === $kw ) {
+                        $issues[] = 'geen focus keyphrase';
+                        $summary['no_focus_keyphrase']++;
+                    }
+                    if ( ! $thumb ) {
+                        $issues[] = 'geen featured image';
+                        $summary['no_featured_image']++;
+                    }
+                    if ( $noindex ) {
+                        $issues[] = 'pagina op no-index';
+                        $summary['page_noindex']++;
+                    }
+
+                    if ( ! empty( $issues ) ) {
+                        $items[] = array(
+                            'id'     => (int) $p->ID,
+                            'title'  => get_the_title( $p ),
+                            'slug'   => $p->post_name,
+                            'status' => $p->post_status,
+                            'issues' => $issues,
+                        );
+                    }
+                }
+
+                return array(
+                    'type'           => $type,
+                    'scanned'        => count( $all ),
+                    'with_issues'    => count( $items ),
+                    'site_indexable' => $site_indexable,
+                    'summary'        => $summary,
+                    'items'          => $items,
+                );
             },
             'permission_callback' => function () {
                 return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
