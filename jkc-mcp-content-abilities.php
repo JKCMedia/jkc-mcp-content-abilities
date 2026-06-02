@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.6.0
+ * Version:           1.7.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -867,6 +867,68 @@ function jkc_mcp_register_abilities() {
                     'focus_keyphrase'  => (string) get_post_meta( $post->ID, '_yoast_wpseo_focuskw', true ),
                     'seo_title'        => (string) get_post_meta( $post->ID, '_yoast_wpseo_title', true ),
                 );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array(
+                'annotations' => array( 'readonly' => false, 'destructive' => true ),
+                'mcp'         => array( 'public' => true ),
+            ),
+        )
+    );
+
+    /* ---- WRITE: bulk update SEO meta --------------------------------- */
+    wp_register_ability(
+        'jkc/bulk-update-seo-meta',
+        array(
+            'label'         => __( 'Bulk Update SEO Meta', 'jkc-mcp' ),
+            'description'   => __( 'Apply Yoast meta (meta_description, focus_keyphrase, seo_title) to many pages/posts at once. Provide an "items" array where each item has slug or id plus the fields to set. Generate the texts first, show the user the batch and get approval before calling.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'items' => array(
+                        'type'        => 'array',
+                        'description' => 'Lijst van objecten: {slug of id, meta_description?, focus_keyphrase?, seo_title?, type?}.',
+                    ),
+                ),
+                'required'   => array( 'items' ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $items = ( isset( $input['items'] ) && is_array( $input['items'] ) ) ? $input['items'] : array();
+                if ( empty( $items ) ) {
+                    return array( 'error' => true, 'message' => 'Geef een niet-lege items-lijst.' );
+                }
+                $results = array();
+                $ok      = 0;
+                foreach ( $items as $it ) {
+                    if ( ! is_array( $it ) ) {
+                        continue;
+                    }
+                    $post = jkc_mcp_resolve_post( $it );
+                    if ( is_wp_error( $post ) ) {
+                        $results[] = array( 'input' => $it, 'status' => 'niet gevonden' );
+                        continue;
+                    }
+                    if ( ! current_user_can( 'edit_post', $post->ID ) ) {
+                        $results[] = array( 'id' => (int) $post->ID, 'status' => 'geen rechten' );
+                        continue;
+                    }
+                    if ( isset( $it['meta_description'] ) ) {
+                        update_post_meta( $post->ID, '_yoast_wpseo_metadesc', sanitize_text_field( $it['meta_description'] ) );
+                    }
+                    if ( isset( $it['focus_keyphrase'] ) ) {
+                        update_post_meta( $post->ID, '_yoast_wpseo_focuskw', sanitize_text_field( $it['focus_keyphrase'] ) );
+                    }
+                    if ( isset( $it['seo_title'] ) ) {
+                        update_post_meta( $post->ID, '_yoast_wpseo_title', sanitize_text_field( $it['seo_title'] ) );
+                    }
+                    $ok++;
+                    $results[] = array( 'id' => (int) $post->ID, 'title' => get_the_title( $post ), 'status' => 'bijgewerkt' );
+                }
+                return array( 'updated' => $ok, 'total' => count( $items ), 'results' => $results );
             },
             'permission_callback' => function () {
                 return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
