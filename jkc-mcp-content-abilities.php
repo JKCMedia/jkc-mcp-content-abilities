@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.3.0
+ * Version:           1.4.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -11,6 +11,23 @@
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
+}
+
+/* =========================================================================
+ * AUTO-UPDATE via GitHub (publieke repo, geen token nodig)
+ * WordPress toont een update zodra de Version-header op de main-branch hoger is.
+ * ====================================================================== */
+$jkc_mcp_puc = __DIR__ . '/plugin-update-checker/plugin-update-checker.php';
+if ( file_exists( $jkc_mcp_puc ) ) {
+    require_once $jkc_mcp_puc;
+    if ( class_exists( '\YahnisElsts\PluginUpdateChecker\v5\PucFactory' ) ) {
+        $jkc_mcp_update_checker = \YahnisElsts\PluginUpdateChecker\v5\PucFactory::buildUpdateChecker(
+            'https://github.com/JKCMedia/jkc-mcp-content-abilities/',
+            __FILE__,
+            'jkc-mcp-content-abilities'
+        );
+        $jkc_mcp_update_checker->setBranch( 'main' );
+    }
 }
 
 /* =========================================================================
