@@ -1,7 +1,7 @@
 === JKC MCP Content Abilities ===
 Contributors: jkcmedia
 Requires PHP: 7.4
-Stable tag: 1.8.2
+Stable tag: 1.9.0
 License: GPLv2 or later
 
 Stelt lees-, audit- en schrijf-abilities beschikbaar aan de WordPress MCP Adapter,
@@ -34,6 +34,8 @@ Werkt voor pagina's (type "page", standaard) en berichten (type "post").
 Alle abilities zijn meta.mcp.public = true en verschijnen op de default server.
 
 == Changelog ==
+= 1.9.0 =
+* WooCommerce: orders (lezen + status wijzigen), klanten (lezen) en kortingscodes (lezen + aanmaken).
 = 1.8.2 =
 * bulk-seo-audit ondersteunt nu ook WooCommerce-producten (type "product").
 = 1.8.1 =

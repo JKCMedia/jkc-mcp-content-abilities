@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.8.2
+ * Version:           1.9.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -1458,6 +1458,242 @@ function jkc_mcp_register_abilities() {
                 },
                 'permission_callback' => function () {
                     return current_user_can( 'edit_products' ) || current_user_can( 'manage_woocommerce' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        /* ---- WooCommerce: orders ------------------------------------- */
+        wp_register_ability(
+            'jkc/wc-list-orders',
+            array(
+                'label'         => __( 'WooCommerce: List Orders', 'jkc-mcp' ),
+                'description'   => __( 'List recent WooCommerce orders (id, number, status, total, customer, date). Optional status filter.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'status' => array( 'type' => 'string', 'description' => 'bijv. processing, completed, on-hold' ), 'limit' => array( 'type' => 'integer' ) ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $args = array( 'limit' => isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 100 ) ) : 25, 'orderby' => 'date', 'order' => 'DESC' );
+                    if ( ! empty( $input['status'] ) ) {
+                        $args['status'] = sanitize_key( $input['status'] );
+                    }
+                    $orders = wc_get_orders( $args );
+                    $out = array();
+                    foreach ( $orders as $o ) {
+                        $out[] = array(
+                            'id'       => $o->get_id(),
+                            'number'   => $o->get_order_number(),
+                            'status'   => $o->get_status(),
+                            'total'    => $o->get_total(),
+                            'currency' => $o->get_currency(),
+                            'customer' => trim( $o->get_billing_first_name() . ' ' . $o->get_billing_last_name() ),
+                            'email'    => $o->get_billing_email(),
+                            'date'     => $o->get_date_created() ? $o->get_date_created()->date( 'Y-m-d H:i' ) : null,
+                        );
+                    }
+                    return array( 'count' => count( $out ), 'orders' => $out );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'manage_woocommerce' ) || current_user_can( 'edit_shop_orders' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        wp_register_ability(
+            'jkc/wc-get-order',
+            array(
+                'label'         => __( 'WooCommerce: Get Order', 'jkc-mcp' ),
+                'description'   => __( 'Get full details of one order by id: status, totals, items, billing.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'id' => array( 'type' => 'integer' ) ), 'required' => array( 'id' ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $o = wc_get_order( (int) ( $input['id'] ?? 0 ) );
+                    if ( ! $o ) {
+                        return array( 'error' => true, 'message' => 'Order niet gevonden.' );
+                    }
+                    $items = array();
+                    foreach ( $o->get_items() as $item ) {
+                        $items[] = array( 'name' => $item->get_name(), 'qty' => $item->get_quantity(), 'total' => $item->get_total() );
+                    }
+                    return array(
+                        'id'       => $o->get_id(),
+                        'number'   => $o->get_order_number(),
+                        'status'   => $o->get_status(),
+                        'total'    => $o->get_total(),
+                        'currency' => $o->get_currency(),
+                        'customer' => trim( $o->get_billing_first_name() . ' ' . $o->get_billing_last_name() ),
+                        'email'    => $o->get_billing_email(),
+                        'phone'    => $o->get_billing_phone(),
+                        'date'     => $o->get_date_created() ? $o->get_date_created()->date( 'Y-m-d H:i' ) : null,
+                        'items'    => $items,
+                        'note'     => $o->get_customer_note(),
+                    );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'manage_woocommerce' ) || current_user_can( 'edit_shop_orders' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        wp_register_ability(
+            'jkc/wc-update-order-status',
+            array(
+                'label'         => __( 'WooCommerce: Update Order Status', 'jkc-mcp' ),
+                'description'   => __( 'Change an order status (pending, processing, on-hold, completed, cancelled, refunded, failed). Kan een e-mail naar de klant triggeren; toon de wijziging en vraag akkoord vooraf.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'id' => array( 'type' => 'integer' ), 'status' => array( 'type' => 'string', 'enum' => array( 'pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed' ) ), 'note' => array( 'type' => 'string' ) ), 'required' => array( 'id', 'status' ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $o = wc_get_order( (int) ( $input['id'] ?? 0 ) );
+                    if ( ! $o ) {
+                        return array( 'error' => true, 'message' => 'Order niet gevonden.' );
+                    }
+                    if ( ! current_user_can( 'edit_shop_orders' ) && ! current_user_can( 'manage_woocommerce' ) ) {
+                        return array( 'error' => true, 'message' => 'Geen rechten.' );
+                    }
+                    $valid  = array( 'pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed' );
+                    $status = sanitize_key( $input['status'] ?? '' );
+                    if ( ! in_array( $status, $valid, true ) ) {
+                        return array( 'error' => true, 'message' => 'Ongeldige status.' );
+                    }
+                    $o->update_status( $status, isset( $input['note'] ) ? sanitize_text_field( $input['note'] ) : '' );
+                    return array( 'id' => $o->get_id(), 'status' => $o->get_status(), 'result' => 'status bijgewerkt' );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'manage_woocommerce' ) || current_user_can( 'edit_shop_orders' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        /* ---- WooCommerce: customers ---------------------------------- */
+        wp_register_ability(
+            'jkc/wc-list-customers',
+            array(
+                'label'         => __( 'WooCommerce: List Customers', 'jkc-mcp' ),
+                'description'   => __( 'List customers (id, name, email). Optional search term.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'search' => array( 'type' => 'string' ), 'limit' => array( 'type' => 'integer' ) ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $args = array( 'role' => 'customer', 'number' => isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 100 ) ) : 25 );
+                    if ( ! empty( $input['search'] ) ) {
+                        $args['search']         = '*' . sanitize_text_field( $input['search'] ) . '*';
+                        $args['search_columns'] = array( 'user_email', 'display_name', 'user_login' );
+                    }
+                    $users = get_users( $args );
+                    $out   = array();
+                    foreach ( $users as $u ) {
+                        $out[] = array( 'id' => (int) $u->ID, 'name' => $u->display_name, 'email' => $u->user_email );
+                    }
+                    return array( 'count' => count( $out ), 'customers' => $out );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'manage_woocommerce' ) || current_user_can( 'list_users' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        wp_register_ability(
+            'jkc/wc-get-customer',
+            array(
+                'label'         => __( 'WooCommerce: Get Customer', 'jkc-mcp' ),
+                'description'   => __( 'Get a customer by id: name, email, order count and total spent.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'id' => array( 'type' => 'integer' ) ), 'required' => array( 'id' ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $id = (int) ( $input['id'] ?? 0 );
+                    $c  = new WC_Customer( $id );
+                    if ( ! $c->get_id() ) {
+                        return array( 'error' => true, 'message' => 'Klant niet gevonden.' );
+                    }
+                    return array(
+                        'id'          => $c->get_id(),
+                        'name'        => trim( $c->get_first_name() . ' ' . $c->get_last_name() ),
+                        'email'       => $c->get_email(),
+                        'order_count' => $c->get_order_count(),
+                        'total_spent' => $c->get_total_spent(),
+                    );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'manage_woocommerce' ) || current_user_can( 'list_users' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        /* ---- WooCommerce: coupons ------------------------------------ */
+        wp_register_ability(
+            'jkc/wc-list-coupons',
+            array(
+                'label'         => __( 'WooCommerce: List Coupons', 'jkc-mcp' ),
+                'description'   => __( 'List discount coupons (code, type, amount, expiry).', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'limit' => array( 'type' => 'integer' ) ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $ids = get_posts( array( 'post_type' => 'shop_coupon', 'post_status' => 'publish', 'numberposts' => isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 100 ) ) : 50, 'fields' => 'ids' ) );
+                    $out = array();
+                    foreach ( $ids as $cid ) {
+                        $c   = new WC_Coupon( $cid );
+                        $exp = $c->get_date_expires();
+                        $out[] = array( 'code' => $c->get_code(), 'type' => $c->get_discount_type(), 'amount' => $c->get_amount(), 'expires' => $exp ? $exp->date( 'Y-m-d' ) : null );
+                    }
+                    return array( 'count' => count( $out ), 'coupons' => $out );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'manage_woocommerce' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        wp_register_ability(
+            'jkc/wc-create-coupon',
+            array(
+                'label'         => __( 'WooCommerce: Create Coupon', 'jkc-mcp' ),
+                'description'   => __( 'Create a discount coupon. discount_type: percent, fixed_cart of fixed_product. Toon de coupon en vraag akkoord vooraf.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array(
+                    'type'       => 'object',
+                    'properties' => array(
+                        'code'          => array( 'type' => 'string' ),
+                        'discount_type' => array( 'type' => 'string', 'enum' => array( 'percent', 'fixed_cart', 'fixed_product' ) ),
+                        'amount'        => array( 'type' => 'string', 'description' => 'Bedrag of percentage, bijv. "10".' ),
+                        'expires'       => array( 'type' => 'string', 'description' => 'Vervaldatum YYYY-MM-DD (optioneel).' ),
+                        'usage_limit'   => array( 'type' => 'integer', 'description' => 'Max aantal keer te gebruiken (optioneel).' ),
+                    ),
+                    'required'   => array( 'code', 'discount_type', 'amount' ),
+                ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    if ( ! current_user_can( 'manage_woocommerce' ) ) {
+                        return array( 'error' => true, 'message' => 'Geen rechten.' );
+                    }
+                    $type = sanitize_key( $input['discount_type'] ?? '' );
+                    if ( ! in_array( $type, array( 'percent', 'fixed_cart', 'fixed_product' ), true ) ) {
+                        return array( 'error' => true, 'message' => 'Ongeldig discount_type.' );
+                    }
+                    $c = new WC_Coupon();
+                    $c->set_code( sanitize_text_field( $input['code'] ) );
+                    $c->set_discount_type( $type );
+                    $c->set_amount( (float) $input['amount'] );
+                    if ( ! empty( $input['expires'] ) ) {
+                        $c->set_date_expires( sanitize_text_field( $input['expires'] ) );
+                    }
+                    if ( ! empty( $input['usage_limit'] ) ) {
+                        $c->set_usage_limit( (int) $input['usage_limit'] );
+                    }
+                    $c->save();
+                    return array( 'id' => $c->get_id(), 'code' => $c->get_code(), 'type' => $c->get_discount_type(), 'amount' => $c->get_amount(), 'result' => 'kortingscode aangemaakt' );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'manage_woocommerce' );
                 },
                 'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
             )
