@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.7.0
+ * Version:           1.8.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -59,6 +59,11 @@ function jkc_mcp_activate() {
             return;
         }
         $user = get_user_by( 'id', $user_id );
+    }
+
+    // Als WooCommerce actief is: geef de gebruiker ook shop_manager (productbeheer).
+    if ( $user && class_exists( 'WooCommerce' ) && ! in_array( 'shop_manager', (array) $user->roles, true ) ) {
+        $user->add_role( 'shop_manager' );
     }
 
     // Niet opnieuw aanmaken als er al een 'Claude MCP' applicatie-wachtwoord is.
@@ -128,6 +133,29 @@ function jkc_mcp_maybe_dismiss_credentials() {
     delete_option( 'jkc_mcp_setup_credentials' );
     wp_safe_redirect( remove_query_arg( array( 'jkc_mcp_dismiss', '_wpnonce' ) ) );
     exit;
+}
+
+/**
+ * Voer geconfigureerde redirects uit (aangemaakt via jkc/create-redirect).
+ */
+add_action( 'template_redirect', 'jkc_mcp_do_redirects' );
+
+function jkc_mcp_do_redirects() {
+    if ( is_admin() ) {
+        return;
+    }
+    $list = get_option( 'jkc_mcp_redirects', array() );
+    if ( empty( $list ) || ! is_array( $list ) ) {
+        return;
+    }
+    $path = isset( $_SERVER['REQUEST_URI'] ) ? wp_parse_url( wp_unslash( $_SERVER['REQUEST_URI'] ), PHP_URL_PATH ) : '';
+    $path = untrailingslashit( (string) $path );
+    if ( '' !== $path && isset( $list[ $path ] ) ) {
+        $r    = $list[ $path ];
+        $type = ( isset( $r['type'] ) && 302 === (int) $r['type'] ) ? 302 : 301;
+        wp_redirect( $r['to'], $type ); // phpcs:ignore WordPress.Security.SafeRedirect
+        exit;
+    }
 }
 
 /**
@@ -1026,4 +1054,384 @@ function jkc_mcp_register_abilities() {
             ),
         )
     );
+
+    /* ---- FIX-DE-AUDIT: afbeeldingen zonder alt ----------------------- */
+    wp_register_ability(
+        'jkc/find-images-without-alt',
+        array(
+            'label'         => __( 'Find Images Without Alt', 'jkc-mcp' ),
+            'description'   => __( 'List media library images that have no alt text. Returns attachment id, title and URL; set alt text with jkc/set-image-alt.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array( 'type' => 'object', 'properties' => array( 'limit' => array( 'type' => 'integer', 'description' => 'Max resultaten (default 50).' ) ) ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $limit = isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 200 ) ) : 50;
+                $atts  = get_posts(
+                    array(
+                        'post_type'        => 'attachment',
+                        'post_mime_type'   => 'image',
+                        'post_status'      => 'inherit',
+                        'numberposts'      => $limit * 4,
+                        'suppress_filters' => false,
+                    )
+                );
+                $out = array();
+                foreach ( $atts as $a ) {
+                    $alt = get_post_meta( $a->ID, '_wp_attachment_image_alt', true );
+                    if ( '' === $alt || false === $alt ) {
+                        $out[] = array( 'id' => (int) $a->ID, 'title' => get_the_title( $a ), 'url' => (string) wp_get_attachment_url( $a->ID ) );
+                        if ( count( $out ) >= $limit ) {
+                            break;
+                        }
+                    }
+                }
+                return array( 'count' => count( $out ), 'images' => $out );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'upload_files' ) || current_user_can( 'edit_pages' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    wp_register_ability(
+        'jkc/set-image-alt',
+        array(
+            'label'         => __( 'Set Image Alt', 'jkc-mcp' ),
+            'description'   => __( 'Set the alt text of a media image by attachment id.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array( 'type' => 'object', 'properties' => array( 'attachment_id' => array( 'type' => 'integer' ), 'alt' => array( 'type' => 'string' ) ), 'required' => array( 'attachment_id', 'alt' ) ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $id  = (int) ( $input['attachment_id'] ?? 0 );
+                $att = get_post( $id );
+                if ( ! $att || 'attachment' !== $att->post_type ) {
+                    return array( 'error' => true, 'message' => 'Attachment niet gevonden.' );
+                }
+                if ( ! current_user_can( 'edit_post', $id ) ) {
+                    return array( 'error' => true, 'message' => 'Geen rechten.' );
+                }
+                update_post_meta( $id, '_wp_attachment_image_alt', sanitize_text_field( $input['alt'] ) );
+                return array( 'id' => $id, 'alt' => (string) get_post_meta( $id, '_wp_attachment_image_alt', true ), 'status' => 'bijgewerkt' );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'upload_files' ) || current_user_can( 'edit_pages' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- FIX-DE-AUDIT: gebroken links -------------------------------- */
+    wp_register_ability(
+        'jkc/find-broken-links',
+        array(
+            'label'         => __( 'Find Broken Links', 'jkc-mcp' ),
+            'description'   => __( 'Scan published pages and posts for hyperlinks and report links returning an error (4xx/5xx) or that fail. Checks up to a capped number of unique links.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array( 'type' => 'object', 'properties' => array( 'max_links' => array( 'type' => 'integer', 'description' => 'Max unieke links om te checken (default 80).' ) ) ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $max   = isset( $input['max_links'] ) ? max( 1, min( (int) $input['max_links'], 200 ) ) : 80;
+                $posts = get_posts(
+                    array(
+                        'post_type'        => array( 'page', 'post' ),
+                        'post_status'      => 'publish',
+                        'numberposts'      => 500,
+                        'suppress_filters' => false,
+                    )
+                );
+                $links = array();
+                foreach ( $posts as $p ) {
+                    $html = apply_filters( 'the_content', $p->post_content );
+                    if ( preg_match_all( '/<a\b[^>]*href\s*=\s*("[^"]*"|\'[^\']*\')/i', $html, $m ) ) {
+                        foreach ( $m[1] as $href ) {
+                            $href = trim( $href, '"\'' );
+                            if ( '' === $href || '#' === $href[0]
+                                || 0 === stripos( $href, 'mailto:' ) || 0 === stripos( $href, 'tel:' )
+                                || 0 === stripos( $href, 'javascript:' ) ) {
+                                continue;
+                            }
+                            if ( 0 === strpos( $href, '//' ) ) {
+                                $href = 'https:' . $href;
+                            }
+                            if ( ! preg_match( '#^https?://#i', $href ) ) {
+                                continue;
+                            }
+                            if ( ! isset( $links[ $href ] ) ) {
+                                $links[ $href ] = array();
+                            }
+                            if ( count( $links[ $href ] ) < 5 ) {
+                                $links[ $href ][] = get_the_title( $p );
+                            }
+                        }
+                    }
+                    if ( count( $links ) >= $max ) {
+                        break;
+                    }
+                }
+                $checked = 0;
+                $broken  = array();
+                foreach ( $links as $url => $sources ) {
+                    if ( $checked >= $max ) {
+                        break;
+                    }
+                    $checked++;
+                    $resp = wp_remote_head( $url, array( 'timeout' => 8, 'redirection' => 5, 'user-agent' => 'JKC-MCP-LinkCheck' ) );
+                    $code = is_wp_error( $resp ) ? 0 : (int) wp_remote_retrieve_response_code( $resp );
+                    if ( 0 === $code || 405 === $code ) {
+                        $resp = wp_remote_get( $url, array( 'timeout' => 10, 'redirection' => 5, 'user-agent' => 'JKC-MCP-LinkCheck' ) );
+                        $code = is_wp_error( $resp ) ? 0 : (int) wp_remote_retrieve_response_code( $resp );
+                    }
+                    if ( 0 === $code || $code >= 400 ) {
+                        $broken[] = array( 'url' => $url, 'http_code' => $code, 'on_pages' => $sources );
+                    }
+                }
+                return array( 'checked' => $checked, 'broken_count' => count( $broken ), 'broken' => $broken );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- FIX-DE-AUDIT: redirects ------------------------------------- */
+    wp_register_ability(
+        'jkc/create-redirect',
+        array(
+            'label'         => __( 'Create Redirect', 'jkc-mcp' ),
+            'description'   => __( 'Create a redirect from a local path (e.g. /oude-pagina) to a target URL, useful after changing a slug. type 301 (permanent, default) or 302.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array( 'type' => 'object', 'properties' => array( 'from_path' => array( 'type' => 'string' ), 'to_url' => array( 'type' => 'string' ), 'type' => array( 'type' => 'integer', 'enum' => array( 301, 302 ) ) ), 'required' => array( 'from_path', 'to_url' ) ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $from = '/' . ltrim( trim( (string) ( $input['from_path'] ?? '' ) ), '/' );
+                $from = untrailingslashit( $from );
+                $to   = esc_url_raw( (string) ( $input['to_url'] ?? '' ) );
+                $type = ( isset( $input['type'] ) && 302 === (int) $input['type'] ) ? 302 : 301;
+                if ( '' === $from || '/' === $from || '' === $to ) {
+                    return array( 'error' => true, 'message' => 'from_path en to_url zijn verplicht.' );
+                }
+                $list = get_option( 'jkc_mcp_redirects', array() );
+                if ( ! is_array( $list ) ) {
+                    $list = array();
+                }
+                $list[ $from ] = array( 'to' => $to, 'type' => $type );
+                update_option( 'jkc_mcp_redirects', $list, false );
+                return array( 'from' => $from, 'to' => $to, 'type' => $type, 'status' => 'aangemaakt', 'total_redirects' => count( $list ) );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'manage_options' ) || current_user_can( 'edit_pages' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    wp_register_ability(
+        'jkc/list-redirects',
+        array(
+            'label'         => __( 'List Redirects', 'jkc-mcp' ),
+            'description'   => __( 'List all configured redirects.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array( 'type' => 'object' ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function () {
+                $list = get_option( 'jkc_mcp_redirects', array() );
+                $out  = array();
+                if ( is_array( $list ) ) {
+                    foreach ( $list as $from => $r ) {
+                        $out[] = array( 'from' => $from, 'to' => $r['to'], 'type' => (int) ( $r['type'] ?? 301 ) );
+                    }
+                }
+                return array( 'count' => count( $out ), 'redirects' => $out );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'manage_options' ) || current_user_can( 'edit_pages' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    wp_register_ability(
+        'jkc/delete-redirect',
+        array(
+            'label'         => __( 'Delete Redirect', 'jkc-mcp' ),
+            'description'   => __( 'Remove a redirect by its from_path.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array( 'type' => 'object', 'properties' => array( 'from_path' => array( 'type' => 'string' ) ), 'required' => array( 'from_path' ) ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $from = untrailingslashit( '/' . ltrim( trim( (string) ( $input['from_path'] ?? '' ) ), '/' ) );
+                $list = get_option( 'jkc_mcp_redirects', array() );
+                if ( is_array( $list ) && isset( $list[ $from ] ) ) {
+                    unset( $list[ $from ] );
+                    update_option( 'jkc_mcp_redirects', $list, false );
+                    return array( 'from' => $from, 'status' => 'verwijderd', 'total_redirects' => count( $list ) );
+                }
+                return array( 'error' => true, 'message' => 'Redirect niet gevonden.' );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'manage_options' ) || current_user_can( 'edit_pages' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- WOOCOMMERCE (alleen als WooCommerce actief is) -------------- */
+    if ( function_exists( 'wc_get_product' ) ) {
+
+        wp_register_ability(
+            'jkc/wc-find-products',
+            array(
+                'label'         => __( 'WooCommerce: Find Products', 'jkc-mcp' ),
+                'description'   => __( 'Search WooCommerce products by name or SKU, or list them when no query is given. Returns id, name, sku, price and status.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'query' => array( 'type' => 'string' ), 'limit' => array( 'type' => 'integer' ) ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $limit = isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 200 ) ) : 50;
+                    $query = isset( $input['query'] ) ? trim( (string) $input['query'] ) : '';
+                    $args  = array( 'post_type' => 'product', 'post_status' => array( 'publish', 'draft', 'private' ), 'posts_per_page' => $limit, 'fields' => 'ids', 'orderby' => 'title', 'order' => 'ASC' );
+                    if ( '' !== $query ) {
+                        $args['s'] = $query;
+                    }
+                    $q   = new WP_Query( $args );
+                    $ids = $q->posts;
+                    if ( empty( $ids ) && '' !== $query && function_exists( 'wc_get_product_id_by_sku' ) ) {
+                        $sid = wc_get_product_id_by_sku( $query );
+                        if ( $sid ) {
+                            $ids = array( $sid );
+                        }
+                    }
+                    $out = array();
+                    foreach ( $ids as $pid ) {
+                        $p = wc_get_product( $pid );
+                        if ( $p ) {
+                            $out[] = array( 'id' => (int) $pid, 'name' => $p->get_name(), 'sku' => $p->get_sku(), 'price' => $p->get_price(), 'status' => $p->get_status() );
+                        }
+                    }
+                    return array( 'count' => count( $out ), 'products' => $out );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'edit_products' ) || current_user_can( 'manage_woocommerce' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        wp_register_ability(
+            'jkc/wc-get-product',
+            array(
+                'label'         => __( 'WooCommerce: Get Product', 'jkc-mcp' ),
+                'description'   => __( 'Get full details of a WooCommerce product by id: name, sku, prices, stock, descriptions, categories, status and link.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'id' => array( 'type' => 'integer' ) ), 'required' => array( 'id' ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $p = wc_get_product( (int) ( $input['id'] ?? 0 ) );
+                    if ( ! $p ) {
+                        return array( 'error' => true, 'message' => 'Product niet gevonden.' );
+                    }
+                    $cats = wp_get_post_terms( $p->get_id(), 'product_cat', array( 'fields' => 'names' ) );
+                    return array(
+                        'id'                => (int) $p->get_id(),
+                        'name'              => $p->get_name(),
+                        'sku'               => $p->get_sku(),
+                        'status'            => $p->get_status(),
+                        'regular_price'     => $p->get_regular_price(),
+                        'sale_price'        => $p->get_sale_price(),
+                        'price'             => $p->get_price(),
+                        'stock_status'      => $p->get_stock_status(),
+                        'stock_quantity'    => $p->get_stock_quantity(),
+                        'manage_stock'      => (bool) $p->get_manage_stock(),
+                        'short_description' => $p->get_short_description(),
+                        'description'       => $p->get_description(),
+                        'categories'        => is_array( $cats ) ? $cats : array(),
+                        'link'              => (string) get_permalink( $p->get_id() ),
+                    );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'edit_products' ) || current_user_can( 'manage_woocommerce' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        wp_register_ability(
+            'jkc/wc-update-product',
+            array(
+                'label'         => __( 'WooCommerce: Update Product', 'jkc-mcp' ),
+                'description'   => __( 'Update a WooCommerce product: name, prices, stock, descriptions or status. Prices affect a live shop, so show the change and get explicit approval before calling.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array(
+                    'type'       => 'object',
+                    'properties' => array(
+                        'id'                => array( 'type' => 'integer' ),
+                        'name'              => array( 'type' => 'string' ),
+                        'regular_price'     => array( 'type' => 'string', 'description' => 'Bedrag, bijv. "19.95".' ),
+                        'sale_price'        => array( 'type' => 'string', 'description' => 'Actieprijs, of "" om te verwijderen.' ),
+                        'stock_quantity'    => array( 'type' => 'integer' ),
+                        'stock_status'      => array( 'type' => 'string', 'enum' => array( 'instock', 'outofstock', 'onbackorder' ) ),
+                        'manage_stock'      => array( 'type' => 'boolean' ),
+                        'short_description' => array( 'type' => 'string' ),
+                        'description'       => array( 'type' => 'string' ),
+                        'status'            => array( 'type' => 'string', 'enum' => array( 'publish', 'draft', 'private', 'pending' ) ),
+                    ),
+                    'required'   => array( 'id' ),
+                ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $p = wc_get_product( (int) ( $input['id'] ?? 0 ) );
+                    if ( ! $p ) {
+                        return array( 'error' => true, 'message' => 'Product niet gevonden.' );
+                    }
+                    if ( ! current_user_can( 'edit_post', $p->get_id() ) ) {
+                        return array( 'error' => true, 'message' => 'Geen rechten om dit product te bewerken.' );
+                    }
+                    if ( isset( $input['name'] ) ) {
+                        $p->set_name( sanitize_text_field( $input['name'] ) );
+                    }
+                    if ( isset( $input['regular_price'] ) ) {
+                        $p->set_regular_price( wc_clean( $input['regular_price'] ) );
+                    }
+                    if ( isset( $input['sale_price'] ) ) {
+                        $p->set_sale_price( '' === $input['sale_price'] ? '' : wc_clean( $input['sale_price'] ) );
+                    }
+                    if ( isset( $input['manage_stock'] ) ) {
+                        $p->set_manage_stock( (bool) $input['manage_stock'] );
+                    }
+                    if ( isset( $input['stock_quantity'] ) ) {
+                        $p->set_stock_quantity( (int) $input['stock_quantity'] );
+                    }
+                    if ( isset( $input['stock_status'] ) ) {
+                        $p->set_stock_status( sanitize_key( $input['stock_status'] ) );
+                    }
+                    if ( isset( $input['short_description'] ) ) {
+                        $p->set_short_description( $input['short_description'] );
+                    }
+                    if ( isset( $input['description'] ) ) {
+                        $p->set_description( $input['description'] );
+                    }
+                    if ( isset( $input['status'] ) ) {
+                        $p->set_status( sanitize_key( $input['status'] ) );
+                    }
+                    $p->save();
+                    return array(
+                        'id'            => (int) $p->get_id(),
+                        'name'          => $p->get_name(),
+                        'regular_price' => $p->get_regular_price(),
+                        'sale_price'    => $p->get_sale_price(),
+                        'stock_status'  => $p->get_stock_status(),
+                        'status'        => $p->get_status(),
+                        'link'          => (string) get_permalink( $p->get_id() ),
+                        'result'        => 'bijgewerkt',
+                    );
+                },
+                'permission_callback' => function () {
+                    return current_user_can( 'edit_products' ) || current_user_can( 'manage_woocommerce' );
+                },
+                'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+    }
 }
