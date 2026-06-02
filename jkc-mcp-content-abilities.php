@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.8.0
+ * Version:           1.8.1
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -1347,6 +1347,9 @@ function jkc_mcp_register_abilities() {
                         'short_description' => $p->get_short_description(),
                         'description'       => $p->get_description(),
                         'categories'        => is_array( $cats ) ? $cats : array(),
+                        'meta_description'  => (string) get_post_meta( $p->get_id(), '_yoast_wpseo_metadesc', true ),
+                        'focus_keyphrase'   => (string) get_post_meta( $p->get_id(), '_yoast_wpseo_focuskw', true ),
+                        'seo_title'         => (string) get_post_meta( $p->get_id(), '_yoast_wpseo_title', true ),
                         'link'              => (string) get_permalink( $p->get_id() ),
                     );
                 },
@@ -1361,7 +1364,7 @@ function jkc_mcp_register_abilities() {
             'jkc/wc-update-product',
             array(
                 'label'         => __( 'WooCommerce: Update Product', 'jkc-mcp' ),
-                'description'   => __( 'Update a WooCommerce product: name, prices, stock, descriptions or status. Prices affect a live shop, so show the change and get explicit approval before calling.', 'jkc-mcp' ),
+                'description'   => __( 'Update a WooCommerce product: name, prices, stock, descriptions, status and Yoast SEO meta (meta_description, focus_keyphrase, seo_title). Prices affect a live shop, so show the change and get explicit approval before calling.', 'jkc-mcp' ),
                 'category'      => 'jkc-content',
                 'input_schema'  => array(
                     'type'       => 'object',
@@ -1376,6 +1379,9 @@ function jkc_mcp_register_abilities() {
                         'short_description' => array( 'type' => 'string' ),
                         'description'       => array( 'type' => 'string' ),
                         'status'            => array( 'type' => 'string', 'enum' => array( 'publish', 'draft', 'private', 'pending' ) ),
+                        'meta_description'  => array( 'type' => 'string', 'description' => 'Yoast meta description (optioneel).' ),
+                        'focus_keyphrase'   => array( 'type' => 'string', 'description' => 'Yoast focus keyphrase (optioneel).' ),
+                        'seo_title'         => array( 'type' => 'string', 'description' => 'Yoast SEO-titel (optioneel).' ),
                     ),
                     'required'   => array( 'id' ),
                 ),
@@ -1416,15 +1422,30 @@ function jkc_mcp_register_abilities() {
                         $p->set_status( sanitize_key( $input['status'] ) );
                     }
                     $p->save();
+
+                    // Yoast SEO-meta (zelfde keys als pagina's/berichten).
+                    if ( isset( $input['meta_description'] ) ) {
+                        update_post_meta( $p->get_id(), '_yoast_wpseo_metadesc', sanitize_text_field( $input['meta_description'] ) );
+                    }
+                    if ( isset( $input['focus_keyphrase'] ) ) {
+                        update_post_meta( $p->get_id(), '_yoast_wpseo_focuskw', sanitize_text_field( $input['focus_keyphrase'] ) );
+                    }
+                    if ( isset( $input['seo_title'] ) ) {
+                        update_post_meta( $p->get_id(), '_yoast_wpseo_title', sanitize_text_field( $input['seo_title'] ) );
+                    }
+
                     return array(
-                        'id'            => (int) $p->get_id(),
-                        'name'          => $p->get_name(),
-                        'regular_price' => $p->get_regular_price(),
-                        'sale_price'    => $p->get_sale_price(),
-                        'stock_status'  => $p->get_stock_status(),
-                        'status'        => $p->get_status(),
-                        'link'          => (string) get_permalink( $p->get_id() ),
-                        'result'        => 'bijgewerkt',
+                        'id'               => (int) $p->get_id(),
+                        'name'             => $p->get_name(),
+                        'regular_price'    => $p->get_regular_price(),
+                        'sale_price'       => $p->get_sale_price(),
+                        'stock_status'     => $p->get_stock_status(),
+                        'status'           => $p->get_status(),
+                        'meta_description' => (string) get_post_meta( $p->get_id(), '_yoast_wpseo_metadesc', true ),
+                        'focus_keyphrase'  => (string) get_post_meta( $p->get_id(), '_yoast_wpseo_focuskw', true ),
+                        'seo_title'        => (string) get_post_meta( $p->get_id(), '_yoast_wpseo_title', true ),
+                        'link'             => (string) get_permalink( $p->get_id() ),
+                        'result'           => 'bijgewerkt',
                     );
                 },
                 'permission_callback' => function () {
