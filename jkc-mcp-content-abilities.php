@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.8.1
+ * Version:           1.8.2
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -654,18 +654,26 @@ function jkc_mcp_register_abilities() {
         'jkc/bulk-seo-audit',
         array(
             'label'         => __( 'Bulk SEO Audit', 'jkc-mcp' ),
-            'description'   => __( 'Scans all pages or posts and returns a prioritised list of SEO issues per item (missing meta description, missing focus keyphrase, missing featured image, no-index, meta length off). Lightweight site-wide check; use jkc/seo-audit for a deep single-page analysis.', 'jkc-mcp' ),
+            'description'   => __( 'Scans all pages, posts or WooCommerce products and returns a prioritised list of SEO issues per item (missing meta description, missing focus keyphrase, missing featured image, no-index, meta length off). Lightweight site-wide check; use jkc/seo-audit for a deep single-page analysis.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
                 'properties' => array(
-                    'type'  => $type_prop,
+                    'type'  => array(
+                        'type'        => 'string',
+                        'enum'        => array( 'page', 'post', 'product' ),
+                        'description' => 'Content type: "page" (default), "post" of "product" (WooCommerce).',
+                    ),
                     'limit' => array( 'type' => 'integer', 'description' => 'Max items (default 200).' ),
                 ),
             ),
             'output_schema' => array( 'type' => 'object' ),
             'execute_callback'    => function ( array $input ) {
-                $type  = isset( $input['type'] ) && in_array( $input['type'], jkc_mcp_allowed_types(), true )
+                $bulk_types = array( 'page', 'post' );
+                if ( function_exists( 'wc_get_product' ) ) {
+                    $bulk_types[] = 'product';
+                }
+                $type  = isset( $input['type'] ) && in_array( $input['type'], $bulk_types, true )
                     ? $input['type']
                     : 'page';
                 $limit = isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 500 ) ) : 200;
