@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.2.0
+ * Version:           1.3.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -472,6 +472,73 @@ function jkc_mcp_register_abilities() {
                     'focus_keyphrase'  => (string) get_post_meta( $post->ID, '_yoast_wpseo_focuskw', true ),
                     'seo_title'        => (string) get_post_meta( $post->ID, '_yoast_wpseo_title', true ),
                 );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array(
+                'annotations' => array( 'readonly' => true, 'destructive' => false ),
+                'mcp'         => array( 'public' => true ),
+            ),
+        )
+    );
+
+    /* ---- READ: find content (zoek pagina/bericht op naam) ------------ */
+    wp_register_ability(
+        'jkc/find-content',
+        array(
+            'label'         => __( 'Find Content', 'jkc-mcp' ),
+            'description'   => __( 'Search pages or posts by a partial title or slug, or list all of them when no query is given. Use this FIRST when the user refers to a page loosely or in another language (e.g. "the about page", "de over-pagina") to find the correct slug/id before calling get-content, seo-audit or update tools. Returns id, title, slug, status and link.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'query' => array(
+                        'type'        => 'string',
+                        'description' => 'Partial title or slug to match. Leave empty to list everything.',
+                    ),
+                    'type'  => $type_prop,
+                    'limit' => array( 'type' => 'integer', 'description' => 'Max results (default 50).' ),
+                ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $type  = isset( $input['type'] ) && in_array( $input['type'], jkc_mcp_allowed_types(), true )
+                    ? $input['type']
+                    : 'page';
+                $limit = isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 200 ) ) : 50;
+                $q     = isset( $input['query'] ) ? strtolower( trim( $input['query'] ) ) : '';
+
+                $all = get_posts(
+                    array(
+                        'post_type'        => $type,
+                        'post_status'      => array( 'publish', 'draft', 'pending', 'private' ),
+                        'numberposts'      => 200,
+                        'orderby'          => 'title',
+                        'order'            => 'ASC',
+                        'suppress_filters' => false,
+                    )
+                );
+
+                $out = array();
+                foreach ( $all as $p ) {
+                    $title = get_the_title( $p );
+                    if ( '' === $q
+                        || false !== strpos( strtolower( $title ), $q )
+                        || false !== strpos( strtolower( $p->post_name ), $q ) ) {
+                        $out[] = array(
+                            'id'     => (int) $p->ID,
+                            'title'  => $title,
+                            'slug'   => $p->post_name,
+                            'status' => $p->post_status,
+                            'link'   => (string) get_permalink( $p ),
+                        );
+                    }
+                    if ( count( $out ) >= $limit ) {
+                        break;
+                    }
+                }
+                return array( 'type' => $type, 'query' => $q, 'count' => count( $out ), 'results' => $out );
             },
             'permission_callback' => function () {
                 return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
