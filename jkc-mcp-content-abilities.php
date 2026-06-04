@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.9.0
+ * Version:           1.10.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -156,6 +156,33 @@ function jkc_mcp_do_redirects() {
         wp_redirect( $r['to'], $type ); // phpcs:ignore WordPress.Security.SafeRedirect
         exit;
     }
+}
+
+/**
+ * Geef de door dit plugin beheerde JSON-LD structured data uit in de <head>
+ * van singular pagina's (los van de schema die Yoast zelf genereert).
+ */
+add_action( 'wp_head', 'jkc_mcp_output_schema' );
+
+function jkc_mcp_output_schema() {
+    if ( ! is_singular() ) {
+        return;
+    }
+    $raw = (string) get_post_meta( get_queried_object_id(), '_jkc_mcp_schema', true );
+    if ( '' === $raw ) {
+        return;
+    }
+    $data = json_decode( $raw, true );
+    if ( ! is_array( $data ) ) {
+        return;
+    }
+    $json = wp_json_encode( $data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+    if ( false === $json ) {
+        return;
+    }
+    // Veilig in <script>-context: neutraliseer eventuele sluit-tags.
+    $json = str_replace( '</', '<\/', $json );
+    echo "\n<script type=\"application/ld+json\">" . $json . "</script>\n"; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 }
 
 /**
@@ -1280,6 +1307,186 @@ function jkc_mcp_register_abilities() {
             },
             'permission_callback' => function () {
                 return current_user_can( 'manage_options' ) || current_user_can( 'edit_pages' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- SEO: canonical tag (read) ----------------------------------- */
+    wp_register_ability(
+        'jkc/get-canonical',
+        array(
+            'label'         => __( 'Get Canonical URL', 'jkc-mcp' ),
+            'description'   => __( 'Reads the Yoast canonical URL (rel=canonical) of a page, post or product. Returns the explicitly set canonical (empty if none) plus the effective URL Google would otherwise use (the permalink).', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'slug' => array( 'type' => 'string', 'description' => 'The slug (or use id).' ),
+                    'id'   => array( 'type' => 'integer', 'description' => 'The ID (or use slug).' ),
+                    'type' => $type_prop,
+                ),
+            ),
+            'output_schema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'id'            => array( 'type' => 'integer' ),
+                    'canonical'     => array( 'type' => 'string' ),
+                    'effective_url' => array( 'type' => 'string' ),
+                ),
+            ),
+            'execute_callback'    => function ( array $input ) {
+                $post = jkc_mcp_resolve_post( $input );
+                if ( is_wp_error( $post ) ) {
+                    return $post;
+                }
+                return array(
+                    'id'            => (int) $post->ID,
+                    'canonical'     => (string) get_post_meta( $post->ID, '_yoast_wpseo_canonical', true ),
+                    'effective_url' => (string) get_permalink( $post->ID ),
+                );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- SEO: canonical tag (write) ---------------------------------- */
+    wp_register_ability(
+        'jkc/set-canonical',
+        array(
+            'label'         => __( 'Set Canonical URL', 'jkc-mcp' ),
+            'description'   => __( 'Sets or overwrites the Yoast canonical URL of a page, post or product. Pass an empty canonical to clear it (Yoast then falls back to the permalink). Use for duplicate content, keyword cannibalisation, or pages reachable via multiple URLs.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'slug'      => array( 'type' => 'string', 'description' => 'The slug (or use id).' ),
+                    'id'        => array( 'type' => 'integer', 'description' => 'The ID (or use slug).' ),
+                    'type'      => $type_prop,
+                    'canonical' => array( 'type' => 'string', 'description' => 'Absolute canonical URL to set. Empty string clears it.' ),
+                ),
+                'required'   => array( 'canonical' ),
+            ),
+            'output_schema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'id'        => array( 'type' => 'integer' ),
+                    'canonical' => array( 'type' => 'string' ),
+                ),
+            ),
+            'execute_callback'    => function ( array $input ) {
+                $post = jkc_mcp_resolve_post( $input );
+                if ( is_wp_error( $post ) ) {
+                    return $post;
+                }
+                if ( ! current_user_can( 'edit_post', $post->ID ) ) {
+                    return new WP_Error( 'forbidden', __( 'You cannot edit this content.', 'jkc-mcp' ), array( 'status' => 403 ) );
+                }
+                $canonical = isset( $input['canonical'] ) ? trim( (string) $input['canonical'] ) : '';
+                if ( '' === $canonical ) {
+                    delete_post_meta( $post->ID, '_yoast_wpseo_canonical' );
+                } else {
+                    update_post_meta( $post->ID, '_yoast_wpseo_canonical', esc_url_raw( $canonical ) );
+                }
+                return array(
+                    'id'        => (int) $post->ID,
+                    'canonical' => (string) get_post_meta( $post->ID, '_yoast_wpseo_canonical', true ),
+                );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- SEO: structured data / JSON-LD schema (read) ---------------- */
+    wp_register_ability(
+        'jkc/get-schema',
+        array(
+            'label'         => __( 'Get Schema (structured data)', 'jkc-mcp' ),
+            'description'   => __( 'Reads the custom JSON-LD structured data that this plugin manages for a page/post/product and outputs in wp_head. Note: this is the JKC-managed schema block, separate from the schema Yoast generates automatically. Returns the stored JSON-LD object, or empty if none is set.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'slug' => array( 'type' => 'string', 'description' => 'The slug (or use id).' ),
+                    'id'   => array( 'type' => 'integer', 'description' => 'The ID (or use slug).' ),
+                    'type' => $type_prop,
+                ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $post = jkc_mcp_resolve_post( $input );
+                if ( is_wp_error( $post ) ) {
+                    return $post;
+                }
+                $raw    = (string) get_post_meta( $post->ID, '_jkc_mcp_schema', true );
+                $schema = ( '' !== $raw ) ? json_decode( $raw, true ) : null;
+                return array(
+                    'id'         => (int) $post->ID,
+                    'has_schema' => ! empty( $schema ),
+                    'schema'     => $schema,
+                );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- SEO: structured data / JSON-LD schema (write) --------------- */
+    wp_register_ability(
+        'jkc/set-schema',
+        array(
+            'label'         => __( 'Set Schema (structured data)', 'jkc-mcp' ),
+            'description'   => __( 'Sets or replaces the JSON-LD structured data of a page/post/product. The plugin outputs it in wp_head as <script type="application/ld+json">. Pass "schema" as a JSON-LD object with @context and @type (e.g. FAQPage, Article, Product, BreadcrumbList). Pass an empty object to clear it. Generate valid schema.org JSON-LD and confirm with the user before applying.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'slug'   => array( 'type' => 'string', 'description' => 'The slug (or use id).' ),
+                    'id'     => array( 'type' => 'integer', 'description' => 'The ID (or use slug).' ),
+                    'type'   => $type_prop,
+                    'schema' => array( 'type' => 'object', 'description' => 'JSON-LD object with @context and @type. Empty object clears the schema.' ),
+                ),
+                'required'   => array( 'schema' ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $post = jkc_mcp_resolve_post( $input );
+                if ( is_wp_error( $post ) ) {
+                    return $post;
+                }
+                if ( ! current_user_can( 'edit_post', $post->ID ) ) {
+                    return new WP_Error( 'forbidden', __( 'You cannot edit this content.', 'jkc-mcp' ), array( 'status' => 403 ) );
+                }
+                $schema = isset( $input['schema'] ) ? $input['schema'] : null;
+                if ( empty( $schema ) || ! is_array( $schema ) ) {
+                    delete_post_meta( $post->ID, '_jkc_mcp_schema' );
+                    return array( 'id' => (int) $post->ID, 'status' => 'cleared', 'schema' => null );
+                }
+                if ( ! isset( $schema['@context'] ) || ! isset( $schema['@type'] ) ) {
+                    return new WP_Error( 'invalid_schema', __( 'Schema must include @context and @type.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                }
+                $json = wp_json_encode( $schema, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+                if ( false === $json ) {
+                    return new WP_Error( 'invalid_schema', __( 'Could not encode the schema as JSON.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                }
+                update_post_meta( $post->ID, '_jkc_mcp_schema', wp_slash( $json ) );
+                return array(
+                    'id'     => (int) $post->ID,
+                    'status' => 'saved',
+                    'type'   => (string) $schema['@type'],
+                    'schema' => $schema,
+                );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
             },
             'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
         )
