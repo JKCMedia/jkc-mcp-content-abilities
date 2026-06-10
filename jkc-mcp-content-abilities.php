@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.10.0
+ * Version:           1.10.1
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -208,7 +208,7 @@ add_action(
  * ====================================================================== */
 
 function jkc_mcp_allowed_types() {
-    return array( 'page', 'post' );
+    return array( 'page', 'post', 'oplossingen', 'faq', 'pijler', 'cases', 'team' );
 }
 
 function jkc_mcp_allowed_statuses() {
@@ -261,7 +261,13 @@ function jkc_mcp_resolve_post( array $input ) {
 }
 
 function jkc_mcp_publish_cap( $type ) {
-    return ( 'post' === $type ) ? 'publish_posts' : 'publish_pages';
+    $post_type = get_post_type_object( $type );
+
+    if ( $post_type && ! empty( $post_type->cap->publish_posts ) ) {
+        return $post_type->cap->publish_posts;
+    }
+
+    return ( 'page' === $type ) ? 'publish_pages' : 'publish_posts';
 }
 
 /**
@@ -517,7 +523,7 @@ function jkc_mcp_register_abilities() {
     $type_prop = array(
         'type'        => 'string',
         'enum'        => jkc_mcp_allowed_types(),
-        'description' => 'Content type: "page" (default) or "post".',
+        'description' => 'Content type: "page" (default), "post", "oplossingen", "faq", "pijler", "cases" or "team".',
     );
 
     /* ---- READ: get content ------------------------------------------- */
@@ -525,7 +531,7 @@ function jkc_mcp_register_abilities() {
         'jkc/get-content',
         array(
             'label'         => __( 'Get Content', 'jkc-mcp' ),
-            'description'   => __( 'Returns the title, content, status and Yoast SEO meta of a page or post by slug or ID.', 'jkc-mcp' ),
+            'description'   => __( 'Returns the title, content, status and Yoast SEO meta of an allowed content item by slug or ID.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -581,7 +587,7 @@ function jkc_mcp_register_abilities() {
         'jkc/find-content',
         array(
             'label'         => __( 'Find Content', 'jkc-mcp' ),
-            'description'   => __( 'Search pages or posts by a partial title or slug, or list all of them when no query is given. Use this FIRST when the user refers to a page loosely or in another language (e.g. "the about page", "de over-pagina") to find the correct slug/id before calling get-content, seo-audit or update tools. Returns id, title, slug, status and link.', 'jkc-mcp' ),
+            'description'   => __( 'Search allowed content types by a partial title or slug, or list all items when no query is given. Use this FIRST when the user refers to content loosely or in another language to find the correct slug/id before calling get-content, seo-audit or update tools. Returns id, title, slug, status and link.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -648,7 +654,7 @@ function jkc_mcp_register_abilities() {
         'jkc/seo-audit',
         array(
             'label'         => __( 'SEO Audit', 'jkc-mcp' ),
-            'description'   => __( 'Returns a complete SEO snapshot of a page or post: Yoast meta and stored scores, featured image, indexability (site-wide and per-page), and computed checks (keyphrase in title/slug/intro/subheadings, density, word count, H1 count, images without alt, internal/outbound links) plus a list of detected issues.', 'jkc-mcp' ),
+            'description'   => __( 'Returns a complete SEO snapshot of an allowed content item: Yoast meta and stored scores, featured image, indexability, and computed checks plus a list of detected issues.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -688,15 +694,15 @@ function jkc_mcp_register_abilities() {
                 'properties' => array(
                     'type'  => array(
                         'type'        => 'string',
-                        'enum'        => array( 'page', 'post', 'product' ),
-                        'description' => 'Content type: "page" (default), "post" of "product" (WooCommerce).',
+                        'enum'        => array_merge( jkc_mcp_allowed_types(), array( 'product' ) ),
+                        'description' => 'Content type to scan. Defaults to "page". Includes allowed custom post types and "product" when WooCommerce is active.',
                     ),
                     'limit' => array( 'type' => 'integer', 'description' => 'Max items (default 200).' ),
                 ),
             ),
             'output_schema' => array( 'type' => 'object' ),
             'execute_callback'    => function ( array $input ) {
-                $bulk_types = array( 'page', 'post' );
+                $bulk_types = jkc_mcp_allowed_types();
                 if ( function_exists( 'wc_get_product' ) ) {
                     $bulk_types[] = 'product';
                 }
@@ -788,7 +794,7 @@ function jkc_mcp_register_abilities() {
         'jkc/update-content',
         array(
             'label'         => __( 'Update Content', 'jkc-mcp' ),
-            'description'   => __( 'Updates the title, content, status and/or scheduled publish date of an existing page or post. Use publish_date to schedule. Publishing requires publish rights.', 'jkc-mcp' ),
+            'description'   => __( 'Updates the title, content, status and/or scheduled publish date of an existing allowed content item. Use publish_date to schedule. Publishing requires publish rights.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -883,7 +889,7 @@ function jkc_mcp_register_abilities() {
         'jkc/update-seo-meta',
         array(
             'label'         => __( 'Update SEO Meta', 'jkc-mcp' ),
-            'description'   => __( 'Updates the Yoast meta description, focus keyphrase and SEO title of a page or post.', 'jkc-mcp' ),
+            'description'   => __( 'Updates the Yoast meta description, focus keyphrase and SEO title of an allowed content item.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -1008,7 +1014,7 @@ function jkc_mcp_register_abilities() {
         'jkc/create-content',
         array(
             'label'         => __( 'Create Content', 'jkc-mcp' ),
-            'description'   => __( 'Creates a new page or post. Use publish_date to schedule it for a future date/time (status becomes future). Publishing requires publish rights.', 'jkc-mcp' ),
+            'description'   => __( 'Creates a new allowed content item. Use publish_date to schedule it for a future date/time (status becomes future). Publishing requires publish rights.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -1161,7 +1167,7 @@ function jkc_mcp_register_abilities() {
         'jkc/find-broken-links',
         array(
             'label'         => __( 'Find Broken Links', 'jkc-mcp' ),
-            'description'   => __( 'Scan published pages and posts for hyperlinks and report links returning an error (4xx/5xx) or that fail. Checks up to a capped number of unique links.', 'jkc-mcp' ),
+            'description'   => __( 'Scan published allowed content types for hyperlinks and report links returning an error (4xx/5xx) or that fail. Checks up to a capped number of unique links.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array( 'type' => 'object', 'properties' => array( 'max_links' => array( 'type' => 'integer', 'description' => 'Max unieke links om te checken (default 80).' ) ) ),
             'output_schema' => array( 'type' => 'object' ),
@@ -1169,7 +1175,7 @@ function jkc_mcp_register_abilities() {
                 $max   = isset( $input['max_links'] ) ? max( 1, min( (int) $input['max_links'], 200 ) ) : 80;
                 $posts = get_posts(
                     array(
-                        'post_type'        => array( 'page', 'post' ),
+                        'post_type'        => jkc_mcp_allowed_types(),
                         'post_status'      => 'publish',
                         'numberposts'      => 500,
                         'suppress_filters' => false,
@@ -1317,7 +1323,7 @@ function jkc_mcp_register_abilities() {
         'jkc/get-canonical',
         array(
             'label'         => __( 'Get Canonical URL', 'jkc-mcp' ),
-            'description'   => __( 'Reads the Yoast canonical URL (rel=canonical) of a page, post or product. Returns the explicitly set canonical (empty if none) plus the effective URL Google would otherwise use (the permalink).', 'jkc-mcp' ),
+            'description'   => __( 'Reads the Yoast canonical URL (rel=canonical) of an allowed content item. Returns the explicitly set canonical (empty if none) plus the effective URL Google would otherwise use (the permalink).', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -1358,7 +1364,7 @@ function jkc_mcp_register_abilities() {
         'jkc/set-canonical',
         array(
             'label'         => __( 'Set Canonical URL', 'jkc-mcp' ),
-            'description'   => __( 'Sets or overwrites the Yoast canonical URL of a page, post or product. Pass an empty canonical to clear it (Yoast then falls back to the permalink). Use for duplicate content, keyword cannibalisation, or pages reachable via multiple URLs.', 'jkc-mcp' ),
+            'description'   => __( 'Sets or overwrites the Yoast canonical URL of an allowed content item. Pass an empty canonical to clear it (Yoast then falls back to the permalink). Use for duplicate content, keyword cannibalisation, or pages reachable via multiple URLs.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -1408,7 +1414,7 @@ function jkc_mcp_register_abilities() {
         'jkc/get-schema',
         array(
             'label'         => __( 'Get Schema (structured data)', 'jkc-mcp' ),
-            'description'   => __( 'Reads the custom JSON-LD structured data that this plugin manages for a page/post/product and outputs in wp_head. Note: this is the JKC-managed schema block, separate from the schema Yoast generates automatically. Returns the stored JSON-LD object, or empty if none is set.', 'jkc-mcp' ),
+            'description'   => __( 'Reads the custom JSON-LD structured data that this plugin manages for an allowed content item and outputs in wp_head. Note: this is the JKC-managed schema block, separate from the schema Yoast generates automatically. Returns the stored JSON-LD object, or empty if none is set.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -1444,7 +1450,7 @@ function jkc_mcp_register_abilities() {
         'jkc/set-schema',
         array(
             'label'         => __( 'Set Schema (structured data)', 'jkc-mcp' ),
-            'description'   => __( 'Sets or replaces the JSON-LD structured data of a page/post/product. The plugin outputs it in wp_head as <script type="application/ld+json">. Pass "schema" as a JSON-LD object with @context and @type (e.g. FAQPage, Article, Product, BreadcrumbList). Pass an empty object to clear it. Generate valid schema.org JSON-LD and confirm with the user before applying.', 'jkc-mcp' ),
+            'description'   => __( 'Sets or replaces the JSON-LD structured data of an allowed content item. The plugin outputs it in wp_head as <script type="application/ld+json">. Pass "schema" as a JSON-LD object with @context and @type (e.g. FAQPage, Article, Product, BreadcrumbList). Pass an empty object to clear it. Generate valid schema.org JSON-LD and confirm with the user before applying.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
