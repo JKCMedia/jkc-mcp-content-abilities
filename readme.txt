@@ -1,7 +1,7 @@
 === JKC MCP Content Abilities ===
 Contributors: jkcmedia
 Requires PHP: 7.4
-Stable tag: 1.9.0
+Stable tag: 1.11.0
 License: GPLv2 or later
 
 Stelt lees-, audit- en schrijf-abilities beschikbaar aan de WordPress MCP Adapter,
@@ -34,6 +34,16 @@ Werkt voor pagina's (type "page", standaard) en berichten (type "post").
 Alle abilities zijn meta.mcp.public = true en verschijnen op de default server.
 
 == Changelog ==
+= 1.11.0 =
+* Blogposts: get/create/update/seo-audit/update-seo-meta/set-schema en find-content werken volledig voor type "post" (find-content zoekt zonder type voortaan over alle types en geeft per resultaat het type terug).
+* update-seo-meta: nieuw veld "noindex" (pagina/post uit zoekresultaten houden zonder de status te wijzigen) en "canonical" (canonical URL instellen/wissen).
+* seo-audit: bevat nu canonical_url en featured_image_missing, plus issue canonical_differs_from_permalink.
+* bulk-seo-audit: nieuwe filteroptie (o.a. featured_image_missing).
+* Nieuwe tools: jkc/get-internal-links en jkc/check-broken-links (interne links opvragen en controleren, met redirect/eind-URL).
+* Nieuwe tools: jkc/upload-media, jkc/set-featured-image en jkc/update-image-alt.
+* Nieuwe tool: jkc/replace-in-content (find/replace binnen content incl. Visual Composer/Nectar shortcode-koppen).
+* get-content geeft nu ook gedetecteerde koppen (H1-H6) terug, inclusief koppen in page-builder shortcodes.
+* WooCommerce: productcategorieën beheren - jkc/wc-find-categories, jkc/wc-get-category, jkc/wc-update-category en jkc/wc-update-category-seo (Yoast term-meta).
 = 1.9.0 =
 * WooCommerce: orders (lezen + status wijzigen), klanten (lezen) en kortingscodes (lezen + aanmaken).
 = 1.8.2 =

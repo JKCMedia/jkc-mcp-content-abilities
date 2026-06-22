@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.10.1
+ * Version:           1.11.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -301,15 +301,10 @@ function jkc_mcp_build_seo_audit( $obj ) {
     $keyphrase = (string) get_post_meta( $obj->ID, '_yoast_wpseo_focuskw', true );
     $metadesc  = (string) get_post_meta( $obj->ID, '_yoast_wpseo_metadesc', true );
     $seo_title = (string) get_post_meta( $obj->ID, '_yoast_wpseo_title', true );
+    $canonical = (string) get_post_meta( $obj->ID, '_yoast_wpseo_canonical', true );
 
     // Render content (shortcodes / blocks naar echte HTML).
-    global $post;
-    $orig = $post;
-    $post = $obj;
-    setup_postdata( $post );
-    $rendered = apply_filters( 'the_content', $obj->post_content );
-    wp_reset_postdata();
-    $post = $orig;
+    $rendered = jkc_mcp_render_content( $obj );
 
     $text       = trim( preg_replace( '/\s+/', ' ', wp_strip_all_tags( $rendered ) ) );
     $word_count = ( '' === $text ) ? 0 : count( preg_split( '/\s+/', $text ) );
@@ -322,14 +317,11 @@ function jkc_mcp_build_seo_audit( $obj ) {
         ? round( ( $kw_count * max( 1, $kw_words ) ) / $word_count * 100, 2 )
         : 0;
 
-    // Subkoppen (H2/H3).
+    // Subkoppen (H2/H3), inclusief koppen die in page-builder shortcodes zitten.
     $subheads = array();
-    if ( preg_match_all( '/<h([23])[^>]*>(.*?)<\/h\1>/is', $rendered, $m, PREG_SET_ORDER ) ) {
-        foreach ( $m as $h ) {
-            $clean = trim( preg_replace( '/\s+/', ' ', wp_strip_all_tags( $h[2] ) ) );
-            if ( '' !== $clean ) {
-                $subheads[] = $clean;
-            }
+    foreach ( jkc_mcp_extract_headings( $obj->post_content, $rendered ) as $hd ) {
+        if ( in_array( $hd['tag'], array( 'h2', 'h3' ), true ) ) {
+            $subheads[] = $hd['text'];
         }
     }
     $subheads_with_kw = 0;
@@ -352,22 +344,14 @@ function jkc_mcp_build_seo_audit( $obj ) {
         }
     }
 
-    // Links.
-    $home_host = wp_parse_url( home_url(), PHP_URL_HOST );
-    $internal  = 0;
-    $outbound  = 0;
-    if ( preg_match_all( '/<a\b[^>]*href\s*=\s*("[^"]*"|\'[^\']*\')[^>]*>/i', $rendered, $lm ) ) {
-        foreach ( $lm[1] as $href ) {
-            $href = trim( $href, '"\'' );
-            if ( '' === $href || 0 === strpos( $href, '#' ) || 0 === stripos( $href, 'mailto:' ) || 0 === stripos( $href, 'tel:' ) ) {
-                continue;
-            }
-            $host = wp_parse_url( $href, PHP_URL_HOST );
-            if ( ! $host || $host === $home_host ) {
-                $internal++;
-            } else {
-                $outbound++;
-            }
+    // Links (via gedeelde helper, herkent ook relatieve interne links).
+    $internal = 0;
+    $outbound = 0;
+    foreach ( jkc_mcp_extract_links( $rendered ) as $lnk ) {
+        if ( $lnk['internal'] ) {
+            $internal++;
+        } else {
+            $outbound++;
         }
     }
 
@@ -450,6 +434,10 @@ function jkc_mcp_build_seo_audit( $obj ) {
     if ( 0 === $internal ) {
         $issues[] = 'Geen interne links gevonden.';
     }
+    $permalink = (string) get_permalink( $obj );
+    if ( '' !== $canonical && untrailingslashit( $canonical ) !== untrailingslashit( $permalink ) ) {
+        $issues[] = sprintf( 'canonical_differs_from_permalink: canonical (%s) wijkt af van de permalink (%s).', $canonical, $permalink );
+    }
 
     return array(
         'id'     => (int) $obj->ID,
@@ -457,12 +445,13 @@ function jkc_mcp_build_seo_audit( $obj ) {
         'title'  => get_the_title( $obj ),
         'slug'   => $obj->post_name,
         'status' => $obj->post_status,
-        'link'   => (string) get_permalink( $obj ),
+        'link'   => $permalink,
         'seo'    => array(
             'focus_keyphrase'         => $keyphrase,
             'meta_description'        => $metadesc,
             'meta_description_length' => strlen( $metadesc ),
             'seo_title'               => $seo_title,
+            'canonical_url'           => $canonical,
             'seo_score'               => ( '' === $seo_score ) ? null : (int) $seo_score,
             'readability_score'       => ( '' === $read_score ) ? null : (int) $read_score,
         ),
@@ -470,8 +459,9 @@ function jkc_mcp_build_seo_audit( $obj ) {
             'site_indexable' => $site_indexable,
             'page_noindex'   => $page_noindex,
         ),
-        'featured_image' => $featured,
-        'checks'         => array(
+        'featured_image'         => $featured,
+        'featured_image_missing' => ( null === $featured ),
+        'checks'                 => array(
             'word_count'                 => $word_count,
             'keyphrase_count'            => $kw_count,
             'keyphrase_density_pct'      => $density,
@@ -491,6 +481,293 @@ function jkc_mcp_build_seo_audit( $obj ) {
         ),
         'issues' => $issues,
     );
+}
+
+/**
+ * Render de content van een post naar echte HTML (shortcodes/blocks uitgevoerd).
+ *
+ * @param WP_Post $obj
+ * @return string
+ */
+function jkc_mcp_render_content( $obj ) {
+    global $post;
+    $orig = $post;
+    $post = $obj; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+    setup_postdata( $post );
+    $rendered = apply_filters( 'the_content', $obj->post_content );
+    wp_reset_postdata();
+    $post = $orig; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+    return (string) $rendered;
+}
+
+/**
+ * Shortcodes die als kop (heading) fungeren bij page builders.
+ * Filterbaar zodat andere builders later eenvoudig toegevoegd kunnen worden.
+ *
+ * @return string[]
+ */
+function jkc_mcp_heading_shortcodes() {
+    return (array) apply_filters(
+        'jkc_mcp_heading_shortcodes',
+        array( 'nectar_highlighted_text', 'vc_custom_heading', 'ultimate_heading', 'fancy-ul', 'heading', 'trx_sc_title' )
+    );
+}
+
+/**
+ * Haal alle koppen (H1-H6) uit content, inclusief koppen die verstopt zitten
+ * in page-builder shortcodes (bijv. Visual Composer / Nectar).
+ *
+ * @param string      $raw      Ruwe post_content (met shortcodes).
+ * @param string|null $rendered Optioneel: al gerenderde HTML; anders wordt $raw gebruikt.
+ * @return array Lijst van array( 'tag' => 'h2', 'text' => '...', 'source' => 'html|shortcode:naam' ).
+ */
+function jkc_mcp_extract_headings( $raw, $rendered = null ) {
+    if ( null === $rendered ) {
+        $rendered = $raw;
+    }
+    $headings = array();
+    $seen     = array();
+
+    $add = function ( $tag, $text, $source ) use ( &$headings, &$seen ) {
+        $text = trim( preg_replace( '/\s+/', ' ', (string) $text ) );
+        if ( '' === $text ) {
+            return;
+        }
+        $key = strtolower( $tag . '|' . $text );
+        if ( isset( $seen[ $key ] ) ) {
+            return;
+        }
+        $seen[ $key ]  = true;
+        $headings[]    = array( 'tag' => $tag, 'text' => $text, 'source' => $source );
+    };
+
+    // 1. Echte HTML-koppen in de gerenderde output.
+    if ( preg_match_all( '/<h([1-6])\b[^>]*>(.*?)<\/h\1>/is', (string) $rendered, $m, PREG_SET_ORDER ) ) {
+        foreach ( $m as $h ) {
+            $add( 'h' . $h[1], wp_strip_all_tags( $h[2] ), 'html' );
+        }
+    }
+
+    // 2. Koppen verstopt in builder-shortcodes (uit de RUWE content).
+    $shortcodes = jkc_mcp_heading_shortcodes();
+    if ( ! empty( $shortcodes ) && '' !== (string) $raw ) {
+        $alt = implode( '|', array_map( 'preg_quote', $shortcodes ) );
+
+        // 2a. Omsluitende shortcodes: [naam ...]tekst[/naam].
+        if ( preg_match_all( '/\[(' . $alt . ')\b([^\]]*)\](.*?)\[\/\1\]/is', (string) $raw, $sm, PREG_SET_ORDER ) ) {
+            foreach ( $sm as $s ) {
+                $tag  = ( preg_match( '/\btag\s*=\s*["\']?(h[1-6])/i', $s[2], $tm ) ) ? strtolower( $tm[1] ) : 'h2';
+                $body = wp_strip_all_tags( strip_shortcodes( $s[3] ) );
+                if ( '' === trim( $body ) && preg_match( '/\b(?:text|title|heading)\s*=\s*"([^"]*)"/i', $s[2], $am ) ) {
+                    $body = wp_strip_all_tags( $am[1] );
+                }
+                $add( $tag, $body, 'shortcode:' . strtolower( $s[1] ) );
+            }
+        }
+
+        // 2b. Zelfsluitende shortcodes met text/title/heading-attribuut.
+        if ( preg_match_all( '/\[(' . $alt . ')\b([^\]]*?)\/?\]/i', (string) $raw, $sm2, PREG_SET_ORDER ) ) {
+            foreach ( $sm2 as $s ) {
+                if ( preg_match( '/\b(?:text|title|heading)\s*=\s*"([^"]*)"/i', $s[2], $am ) ) {
+                    $tag = ( preg_match( '/\btag\s*=\s*["\']?(h[1-6])/i', $s[2], $tm ) ) ? strtolower( $tm[1] ) : 'h2';
+                    $add( $tag, wp_strip_all_tags( $am[1] ), 'shortcode:' . strtolower( $s[1] ) );
+                }
+            }
+        }
+    }
+
+    return $headings;
+}
+
+/**
+ * Haal alle hyperlinks uit een stuk HTML, met ankertekst en doel-URL.
+ *
+ * @param string $html
+ * @return array Lijst van array( anchor, href, url, relative, internal ).
+ */
+function jkc_mcp_extract_links( $html ) {
+    $links     = array();
+    $home_host = wp_parse_url( home_url(), PHP_URL_HOST );
+
+    if ( ! preg_match_all( '/<a\b[^>]*?href\s*=\s*("[^"]*"|\'[^\']*\')[^>]*>(.*?)<\/a>/is', (string) $html, $m, PREG_SET_ORDER ) ) {
+        return $links;
+    }
+
+    foreach ( $m as $a ) {
+        $href = trim( $a[1], '"\'' );
+        if ( '' === $href ) {
+            continue;
+        }
+        $lower = strtolower( $href );
+        if ( '#' === $href[0]
+            || 0 === strpos( $lower, 'mailto:' )
+            || 0 === strpos( $lower, 'tel:' )
+            || 0 === strpos( $lower, 'javascript:' ) ) {
+            continue;
+        }
+
+        $is_relative = ! preg_match( '#^https?://#i', $href ) && 0 !== strpos( $href, '//' );
+        $resolved    = $href;
+        if ( 0 === strpos( $href, '//' ) ) {
+            $resolved = ( is_ssl() ? 'https:' : 'http:' ) . $href;
+        } elseif ( 0 === strpos( $href, '/' ) ) {
+            $resolved = home_url( $href );
+        }
+
+        $host        = wp_parse_url( $resolved, PHP_URL_HOST );
+        $is_internal = ( ! $host || $host === $home_host );
+
+        $links[] = array(
+            'anchor'   => trim( preg_replace( '/\s+/', ' ', wp_strip_all_tags( $a[2] ) ) ),
+            'href'     => $href,
+            'url'      => $resolved,
+            'relative' => (bool) $is_relative,
+            'internal' => (bool) $is_internal,
+        );
+    }
+
+    return $links;
+}
+
+/**
+ * Controleer of een URL bereikbaar is. Volgt redirects niet automatisch, zodat
+ * een 3xx als redirect gerapporteerd kan worden mét de uiteindelijke URL.
+ *
+ * @param string $url
+ * @return array array( http_code, status, final_url, message ).
+ */
+function jkc_mcp_check_url( $url ) {
+    $args = array(
+        'timeout'     => 8,
+        'redirection' => 0,
+        'sslverify'   => true,
+        'user-agent'  => 'JKC-MCP-LinkCheck',
+    );
+
+    $resp = wp_remote_head( $url, $args );
+    $code = is_wp_error( $resp ) ? 0 : (int) wp_remote_retrieve_response_code( $resp );
+
+    // Sommige servers staan geen HEAD toe (405) of antwoorden niet: probeer GET.
+    if ( is_wp_error( $resp ) || 0 === $code || 405 === $code ) {
+        $resp = wp_remote_get( $url, array_merge( $args, array( 'timeout' => 10 ) ) );
+        $code = is_wp_error( $resp ) ? 0 : (int) wp_remote_retrieve_response_code( $resp );
+    }
+
+    if ( is_wp_error( $resp ) ) {
+        $msg    = $resp->get_error_message();
+        $status = ( false !== stripos( $msg, 'timed out' ) || false !== stripos( $msg, 'timeout' ) ) ? 'timeout' : 'error';
+        return array( 'http_code' => 0, 'status' => $status, 'final_url' => null, 'message' => $msg );
+    }
+
+    $final  = null;
+    $status = 'ok';
+    if ( $code >= 300 && $code < 400 ) {
+        $loc    = wp_remote_retrieve_header( $resp, 'location' );
+        $final  = $loc ? $loc : null;
+        $status = 'redirect';
+    } elseif ( 404 === $code ) {
+        $status = 'not_found';
+    } elseif ( 0 === $code || $code >= 400 ) {
+        $status = 'error';
+    }
+
+    return array( 'http_code' => $code, 'status' => $status, 'final_url' => $final, 'message' => '' );
+}
+
+/**
+ * Stel de alt-tekst van een media-bijlage in (zonder andere metadata te raken).
+ *
+ * @param int    $id  Attachment-ID.
+ * @param string $alt Nieuwe alt-tekst.
+ * @return array|WP_Error
+ */
+function jkc_mcp_set_attachment_alt( $id, $alt ) {
+    $att = get_post( $id );
+    if ( ! $att || 'attachment' !== $att->post_type ) {
+        return new WP_Error( 'not_found', __( 'Attachment niet gevonden.', 'jkc-mcp' ), array( 'status' => 404 ) );
+    }
+    if ( ! current_user_can( 'edit_post', $id ) ) {
+        return new WP_Error( 'forbidden', __( 'Geen rechten.', 'jkc-mcp' ), array( 'status' => 403 ) );
+    }
+    update_post_meta( $id, '_wp_attachment_image_alt', sanitize_text_field( $alt ) );
+    return array( 'id' => (int) $id, 'alt' => (string) get_post_meta( $id, '_wp_attachment_image_alt', true ), 'status' => 'bijgewerkt' );
+}
+
+/**
+ * Lees Yoast SEO-velden van een taxonomy-term (opgeslagen in option wpseo_taxonomy_meta).
+ *
+ * @param string $taxonomy
+ * @param int    $term_id
+ * @return array array( seo_title, meta_description, focus_keyphrase, canonical, noindex ).
+ */
+function jkc_mcp_get_term_yoast( $taxonomy, $term_id ) {
+    $opt  = get_option( 'wpseo_taxonomy_meta', array() );
+    $meta = ( is_array( $opt ) && isset( $opt[ $taxonomy ][ $term_id ] ) ) ? $opt[ $taxonomy ][ $term_id ] : array();
+    return array(
+        'seo_title'        => isset( $meta['wpseo_title'] ) ? (string) $meta['wpseo_title'] : '',
+        'meta_description' => isset( $meta['wpseo_desc'] ) ? (string) $meta['wpseo_desc'] : '',
+        'focus_keyphrase'  => isset( $meta['wpseo_focuskw'] ) ? (string) $meta['wpseo_focuskw'] : '',
+        'canonical'        => isset( $meta['wpseo_canonical'] ) ? (string) $meta['wpseo_canonical'] : '',
+        'noindex'          => isset( $meta['wpseo_noindex'] ) && 'noindex' === $meta['wpseo_noindex'],
+    );
+}
+
+/**
+ * Schrijf Yoast SEO-velden van een taxonomy-term weg.
+ *
+ * @param string $taxonomy
+ * @param int    $term_id
+ * @param array  $fields seo_title, meta_description, focus_keyphrase (alle optioneel).
+ * @return array De bijgewerkte velden (zie jkc_mcp_get_term_yoast()).
+ */
+function jkc_mcp_set_term_yoast( $taxonomy, $term_id, $fields ) {
+    $opt = get_option( 'wpseo_taxonomy_meta', array() );
+    if ( ! is_array( $opt ) ) {
+        $opt = array();
+    }
+    if ( ! isset( $opt[ $taxonomy ] ) || ! is_array( $opt[ $taxonomy ] ) ) {
+        $opt[ $taxonomy ] = array();
+    }
+    if ( ! isset( $opt[ $taxonomy ][ $term_id ] ) || ! is_array( $opt[ $taxonomy ][ $term_id ] ) ) {
+        $opt[ $taxonomy ][ $term_id ] = array();
+    }
+
+    $map = array(
+        'seo_title'        => 'wpseo_title',
+        'meta_description' => 'wpseo_desc',
+        'focus_keyphrase'  => 'wpseo_focuskw',
+    );
+    foreach ( $map as $in => $yk ) {
+        if ( isset( $fields[ $in ] ) ) {
+            $opt[ $taxonomy ][ $term_id ][ $yk ] = sanitize_text_field( $fields[ $in ] );
+        }
+    }
+
+    update_option( 'wpseo_taxonomy_meta', $opt );
+    return jkc_mcp_get_term_yoast( $taxonomy, $term_id );
+}
+
+/**
+ * Resolve een taxonomy-term op ID of slug.
+ *
+ * @param array  $input    Verwacht 'id' (int) en/of 'slug' (string).
+ * @param string $taxonomy Taxonomy-slug, bijv. 'product_cat'.
+ * @return WP_Term|WP_Error
+ */
+function jkc_mcp_resolve_term( $input, $taxonomy ) {
+    if ( ! empty( $input['id'] ) ) {
+        $t = get_term( (int) $input['id'], $taxonomy );
+        if ( $t && ! is_wp_error( $t ) ) {
+            return $t;
+        }
+    }
+    if ( ! empty( $input['slug'] ) ) {
+        $t = get_term_by( 'slug', sanitize_title( $input['slug'] ), $taxonomy );
+        if ( $t ) {
+            return $t;
+        }
+    }
+    return new WP_Error( 'not_found', __( 'Term niet gevonden.', 'jkc-mcp' ), array( 'status' => 404 ) );
 }
 
 /* =========================================================================
@@ -548,6 +825,7 @@ function jkc_mcp_register_abilities() {
                     'type'             => array( 'type' => 'string' ),
                     'title'            => array( 'type' => 'string' ),
                     'content'          => array( 'type' => 'string' ),
+                    'headings'         => array( 'type' => 'array', 'description' => 'Gedetecteerde koppen (H1-H6), inclusief koppen in page-builder shortcodes. Elk item: tag, text, source.' ),
                     'status'           => array( 'type' => 'string' ),
                     'link'             => array( 'type' => 'string', 'format' => 'uri' ),
                     'meta_description' => array( 'type' => 'string' ),
@@ -565,6 +843,7 @@ function jkc_mcp_register_abilities() {
                     'type'             => $post->post_type,
                     'title'            => get_the_title( $post ),
                     'content'          => $post->post_content,
+                    'headings'         => jkc_mcp_extract_headings( $post->post_content, jkc_mcp_render_content( $post ) ),
                     'status'           => $post->post_status,
                     'link'             => (string) get_permalink( $post ),
                     'meta_description' => (string) get_post_meta( $post->ID, '_yoast_wpseo_metadesc', true ),
@@ -587,7 +866,7 @@ function jkc_mcp_register_abilities() {
         'jkc/find-content',
         array(
             'label'         => __( 'Find Content', 'jkc-mcp' ),
-            'description'   => __( 'Search allowed content types by a partial title or slug, or list all items when no query is given. Use this FIRST when the user refers to content loosely or in another language to find the correct slug/id before calling get-content, seo-audit or update tools. Returns id, title, slug, status and link.', 'jkc-mcp' ),
+            'description'   => __( 'Search content by a partial title or slug, or list everything when no query is given. Without a "type" it searches across ALL allowed types (pages, posts and custom post types); pass "type" to limit to one. Use this FIRST when the user refers to content loosely or in another language to find the correct slug/id before calling get-content, seo-audit or update tools. Each result includes its type (page/post/...), id, title, slug, status and link.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -602,17 +881,19 @@ function jkc_mcp_register_abilities() {
             ),
             'output_schema' => array( 'type' => 'object' ),
             'execute_callback'    => function ( array $input ) {
-                $type  = isset( $input['type'] ) && in_array( $input['type'], jkc_mcp_allowed_types(), true )
-                    ? $input['type']
-                    : 'page';
+                // Geen type opgegeven: zoek over alle toegestane types (pagina's + berichten + CPT's).
+                // Wel een type opgegeven: alleen dat type.
+                $types = ( isset( $input['type'] ) && in_array( $input['type'], jkc_mcp_allowed_types(), true ) )
+                    ? array( $input['type'] )
+                    : jkc_mcp_allowed_types();
                 $limit = isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 200 ) ) : 50;
                 $q     = isset( $input['query'] ) ? strtolower( trim( $input['query'] ) ) : '';
 
                 $all = get_posts(
                     array(
-                        'post_type'        => $type,
+                        'post_type'        => $types,
                         'post_status'      => array( 'publish', 'draft', 'pending', 'private' ),
-                        'numberposts'      => 200,
+                        'numberposts'      => 300,
                         'orderby'          => 'title',
                         'order'            => 'ASC',
                         'suppress_filters' => false,
@@ -627,6 +908,7 @@ function jkc_mcp_register_abilities() {
                         || false !== strpos( strtolower( $p->post_name ), $q ) ) {
                         $out[] = array(
                             'id'     => (int) $p->ID,
+                            'type'   => $p->post_type,
                             'title'  => $title,
                             'slug'   => $p->post_name,
                             'status' => $p->post_status,
@@ -637,7 +919,7 @@ function jkc_mcp_register_abilities() {
                         break;
                     }
                 }
-                return array( 'type' => $type, 'query' => $q, 'count' => count( $out ), 'results' => $out );
+                return array( 'type' => ( count( $types ) === 1 ? $types[0] : 'all' ), 'query' => $q, 'count' => count( $out ), 'results' => $out );
             },
             'permission_callback' => function () {
                 return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
@@ -654,7 +936,7 @@ function jkc_mcp_register_abilities() {
         'jkc/seo-audit',
         array(
             'label'         => __( 'SEO Audit', 'jkc-mcp' ),
-            'description'   => __( 'Returns a complete SEO snapshot of an allowed content item: Yoast meta and stored scores, featured image, indexability, and computed checks plus a list of detected issues.', 'jkc-mcp' ),
+            'description'   => __( 'Returns a complete SEO snapshot of an allowed content item: Yoast meta (including canonical_url), stored scores, featured_image and featured_image_missing flag, indexability (page_noindex), and computed checks plus a list of detected issues (including canonical_differs_from_permalink).', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -697,6 +979,11 @@ function jkc_mcp_register_abilities() {
                         'enum'        => array_merge( jkc_mcp_allowed_types(), array( 'product' ) ),
                         'description' => 'Content type to scan. Defaults to "page". Includes allowed custom post types and "product" when WooCommerce is active.',
                     ),
+                    'filter' => array(
+                        'type'        => 'string',
+                        'enum'        => array( 'all', 'featured_image_missing', 'no_meta_description', 'no_focus_keyphrase', 'meta_length_off', 'noindex' ),
+                        'description' => 'Toon alleen items met dit probleem. Default "all". Gebruik "featured_image_missing" om alleen items zonder uitgelichte afbeelding te tonen.',
+                    ),
                     'limit' => array( 'type' => 'integer', 'description' => 'Max items (default 200).' ),
                 ),
             ),
@@ -706,10 +993,12 @@ function jkc_mcp_register_abilities() {
                 if ( function_exists( 'wc_get_product' ) ) {
                     $bulk_types[] = 'product';
                 }
-                $type  = isset( $input['type'] ) && in_array( $input['type'], $bulk_types, true )
+                $type   = isset( $input['type'] ) && in_array( $input['type'], $bulk_types, true )
                     ? $input['type']
                     : 'page';
-                $limit = isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 500 ) ) : 200;
+                $valid_filters = array( 'all', 'featured_image_missing', 'no_meta_description', 'no_focus_keyphrase', 'meta_length_off', 'noindex' );
+                $filter = isset( $input['filter'] ) && in_array( $input['filter'], $valid_filters, true ) ? $input['filter'] : 'all';
+                $limit  = isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 500 ) ) : 200;
 
                 $all = get_posts(
                     array(
@@ -759,6 +1048,19 @@ function jkc_mcp_register_abilities() {
                         $summary['page_noindex']++;
                     }
 
+                    // Per-item vlaggen voor de filteroptie.
+                    $flags = array(
+                        'no_meta_description'    => ( '' === $md ),
+                        'meta_length_off'        => ( '' !== $md && ( strlen( $md ) < 120 || strlen( $md ) > 156 ) ),
+                        'no_focus_keyphrase'     => ( '' === $kw ),
+                        'featured_image_missing' => ( ! $thumb ),
+                        'noindex'                => $noindex,
+                    );
+
+                    if ( 'all' !== $filter && empty( $flags[ $filter ] ) ) {
+                        continue; // Voldoet niet aan de gevraagde filter (telt nog wel mee in summary).
+                    }
+
                     if ( ! empty( $issues ) ) {
                         $items[] = array(
                             'id'     => (int) $p->ID,
@@ -772,6 +1074,7 @@ function jkc_mcp_register_abilities() {
 
                 return array(
                     'type'           => $type,
+                    'filter'         => $filter,
                     'scanned'        => count( $all ),
                     'with_issues'    => count( $items ),
                     'site_indexable' => $site_indexable,
@@ -889,7 +1192,7 @@ function jkc_mcp_register_abilities() {
         'jkc/update-seo-meta',
         array(
             'label'         => __( 'Update SEO Meta', 'jkc-mcp' ),
-            'description'   => __( 'Updates the Yoast meta description, focus keyphrase and SEO title of an allowed content item.', 'jkc-mcp' ),
+            'description'   => __( 'Updates the Yoast meta description, focus keyphrase, SEO title, canonical URL and/or noindex flag of an allowed content item. Set noindex=true to keep a page out of search results WITHOUT changing its publication status; noindex=false restores default indexing. Set canonical to an URL (empty string clears it). Each field is optional; only provided fields change.', 'jkc-mcp' ),
             'category'      => 'jkc-content',
             'input_schema'  => array(
                 'type'       => 'object',
@@ -900,6 +1203,8 @@ function jkc_mcp_register_abilities() {
                     'meta_description' => array( 'type' => 'string', 'description' => 'New Yoast meta description (optional).' ),
                     'focus_keyphrase'  => array( 'type' => 'string', 'description' => 'New Yoast focus keyphrase (optional).' ),
                     'seo_title'        => array( 'type' => 'string', 'description' => 'New Yoast SEO title (optional).' ),
+                    'canonical'        => array( 'type' => 'string', 'description' => 'Canonical URL (rel=canonical). Empty string clears it. Optional.' ),
+                    'noindex'          => array( 'type' => 'boolean', 'description' => 'true = noindex (uit zoekresultaten houden zonder de status te wijzigen), false = standaard indexeren. Optioneel.' ),
                 ),
             ),
             'output_schema' => array(
@@ -909,6 +1214,9 @@ function jkc_mcp_register_abilities() {
                     'meta_description' => array( 'type' => 'string' ),
                     'focus_keyphrase'  => array( 'type' => 'string' ),
                     'seo_title'        => array( 'type' => 'string' ),
+                    'canonical'        => array( 'type' => 'string' ),
+                    'noindex'          => array( 'type' => 'boolean' ),
+                    'status'           => array( 'type' => 'string', 'description' => 'Publicatiestatus (blijft ongewijzigd door deze tool).' ),
                 ),
             ),
             'execute_callback'    => function ( array $input ) {
@@ -929,12 +1237,31 @@ function jkc_mcp_register_abilities() {
                 if ( isset( $input['seo_title'] ) ) {
                     update_post_meta( $post->ID, '_yoast_wpseo_title', sanitize_text_field( $input['seo_title'] ) );
                 }
+                if ( isset( $input['canonical'] ) ) {
+                    $canonical = trim( (string) $input['canonical'] );
+                    if ( '' === $canonical ) {
+                        delete_post_meta( $post->ID, '_yoast_wpseo_canonical' );
+                    } else {
+                        update_post_meta( $post->ID, '_yoast_wpseo_canonical', esc_url_raw( $canonical ) );
+                    }
+                }
+                if ( isset( $input['noindex'] ) ) {
+                    // Yoast: '1' = noindex, '2' = expliciet index. false -> meta verwijderen = standaardgedrag (index).
+                    if ( filter_var( $input['noindex'], FILTER_VALIDATE_BOOLEAN ) ) {
+                        update_post_meta( $post->ID, '_yoast_wpseo_meta-robots-noindex', '1' );
+                    } else {
+                        delete_post_meta( $post->ID, '_yoast_wpseo_meta-robots-noindex' );
+                    }
+                }
 
                 return array(
                     'id'               => (int) $post->ID,
                     'meta_description' => (string) get_post_meta( $post->ID, '_yoast_wpseo_metadesc', true ),
                     'focus_keyphrase'  => (string) get_post_meta( $post->ID, '_yoast_wpseo_focuskw', true ),
                     'seo_title'        => (string) get_post_meta( $post->ID, '_yoast_wpseo_title', true ),
+                    'canonical'        => (string) get_post_meta( $post->ID, '_yoast_wpseo_canonical', true ),
+                    'noindex'          => ( '1' === (string) get_post_meta( $post->ID, '_yoast_wpseo_meta-robots-noindex', true ) ),
+                    'status'           => $post->post_status,
                 );
             },
             'permission_callback' => function () {
@@ -1498,6 +1825,391 @@ function jkc_mcp_register_abilities() {
         )
     );
 
+    /* ---- SEO: interne links van een pagina opvragen ------------------ */
+    wp_register_ability(
+        'jkc/get-internal-links',
+        array(
+            'label'         => __( 'Get Internal Links', 'jkc-mcp' ),
+            'description'   => __( 'Returns the links found in a page or post (rendered, so shortcode/builder content is included). Per link: anchor text, target URL, whether it is relative or absolute, and the source content id. By default only internal links; set include_external=true to also return outbound links.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'slug'             => array( 'type' => 'string', 'description' => 'The slug (or use id).' ),
+                    'id'               => array( 'type' => 'integer', 'description' => 'The ID (or use slug).' ),
+                    'type'             => $type_prop,
+                    'include_external' => array( 'type' => 'boolean', 'description' => 'Ook externe links meenemen (default false).' ),
+                ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $post = jkc_mcp_resolve_post( $input );
+                if ( is_wp_error( $post ) ) {
+                    return $post;
+                }
+                $include_external = isset( $input['include_external'] ) && filter_var( $input['include_external'], FILTER_VALIDATE_BOOLEAN );
+                $out = array();
+                foreach ( jkc_mcp_extract_links( jkc_mcp_render_content( $post ) ) as $l ) {
+                    if ( ! $include_external && ! $l['internal'] ) {
+                        continue;
+                    }
+                    $out[] = array(
+                        'anchor'    => $l['anchor'],
+                        'url'       => $l['url'],
+                        'href'      => $l['href'],
+                        'relative'  => $l['relative'],
+                        'internal'  => $l['internal'],
+                        'source_id' => (int) $post->ID,
+                    );
+                }
+                return array( 'id' => (int) $post->ID, 'type' => $post->post_type, 'count' => count( $out ), 'links' => $out );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- SEO: links van een pagina controleren (bereikbaarheid) ------ */
+    wp_register_ability(
+        'jkc/check-broken-links',
+        array(
+            'label'         => __( 'Check Broken Links', 'jkc-mcp' ),
+            'description'   => __( 'Checks whether links are reachable. Provide a page (slug/id/type) to check its links, or an explicit "urls" array. Returns per link the HTTP code and a status (ok/redirect/not_found/timeout/error); for redirects it returns the final target URL. Internal links only by default.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'slug'             => array( 'type' => 'string', 'description' => 'Page slug to check (or use id, or pass urls).' ),
+                    'id'               => array( 'type' => 'integer', 'description' => 'Page ID (or use slug, or pass urls).' ),
+                    'type'             => $type_prop,
+                    'urls'             => array( 'type' => 'array', 'description' => 'Optioneel: expliciete lijst URLs om te checken in plaats van een pagina.' ),
+                    'include_external' => array( 'type' => 'boolean', 'description' => 'Ook externe links checken (default false).' ),
+                    'max_links'        => array( 'type' => 'integer', 'description' => 'Max te checken links (default 50).' ),
+                ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $max              = isset( $input['max_links'] ) ? max( 1, min( (int) $input['max_links'], 200 ) ) : 50;
+                $include_external = isset( $input['include_external'] ) && filter_var( $input['include_external'], FILTER_VALIDATE_BOOLEAN );
+                $to_check         = array(); // url => array( anchor, source_id ).
+
+                if ( ! empty( $input['urls'] ) && is_array( $input['urls'] ) ) {
+                    foreach ( $input['urls'] as $u ) {
+                        $u = esc_url_raw( trim( (string) $u ) );
+                        if ( '' !== $u && ! isset( $to_check[ $u ] ) ) {
+                            $to_check[ $u ] = array( 'anchor' => '', 'source_id' => 0 );
+                        }
+                    }
+                } else {
+                    $post = jkc_mcp_resolve_post( $input );
+                    if ( is_wp_error( $post ) ) {
+                        return $post;
+                    }
+                    foreach ( jkc_mcp_extract_links( jkc_mcp_render_content( $post ) ) as $l ) {
+                        if ( ! $include_external && ! $l['internal'] ) {
+                            continue;
+                        }
+                        if ( ! isset( $to_check[ $l['url'] ] ) ) {
+                            $to_check[ $l['url'] ] = array( 'anchor' => $l['anchor'], 'source_id' => (int) $post->ID );
+                        }
+                    }
+                }
+
+                $results = array();
+                $broken  = 0;
+                $checked = 0;
+                foreach ( $to_check as $url => $meta ) {
+                    if ( $checked >= $max ) {
+                        break;
+                    }
+                    $checked++;
+                    $res       = jkc_mcp_check_url( $url );
+                    $is_broken = in_array( $res['status'], array( 'not_found', 'error', 'timeout' ), true );
+                    if ( $is_broken ) {
+                        $broken++;
+                    }
+                    $results[] = array(
+                        'url'       => $url,
+                        'anchor'    => $meta['anchor'],
+                        'source_id' => $meta['source_id'],
+                        'http_code' => $res['http_code'],
+                        'status'    => $res['status'],
+                        'final_url' => $res['final_url'],
+                        'broken'    => $is_broken,
+                    );
+                }
+                return array( 'checked' => $checked, 'broken_count' => $broken, 'results' => $results );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- WRITE: find/replace binnen content (incl. shortcodes) ------- */
+    wp_register_ability(
+        'jkc/replace-in-content',
+        array(
+            'label'         => __( 'Replace In Content', 'jkc-mcp' ),
+            'description'   => __( 'Find-and-replace within the RAW content of a page/post, including text inside shortcode attributes and shortcode bodies (e.g. Visual Composer / Nectar headings). Operates on the stored markup so the builder structure stays intact. Provide "find" and "replace"; set regex=true for a regular-expression search. Preview with get-content first.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'slug'    => array( 'type' => 'string', 'description' => 'The slug (or use id).' ),
+                    'id'      => array( 'type' => 'integer', 'description' => 'The ID (or use slug).' ),
+                    'type'    => $type_prop,
+                    'find'    => array( 'type' => 'string', 'description' => 'Tekst (of regex-patroon) om te zoeken. Mag tekst binnen shortcodes zijn.' ),
+                    'replace' => array( 'type' => 'string', 'description' => 'Vervangende tekst.' ),
+                    'regex'   => array( 'type' => 'boolean', 'description' => 'true = behandel find als regex (zonder delimiters, ~-delimiter, u-flag). Default false (letterlijke tekst).' ),
+                ),
+                'required'   => array( 'find', 'replace' ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                $post = jkc_mcp_resolve_post( $input );
+                if ( is_wp_error( $post ) ) {
+                    return $post;
+                }
+                if ( ! current_user_can( 'edit_post', $post->ID ) ) {
+                    return new WP_Error( 'forbidden', __( 'You cannot edit this content.', 'jkc-mcp' ), array( 'status' => 403 ) );
+                }
+                $find = isset( $input['find'] ) ? (string) $input['find'] : '';
+                if ( '' === $find ) {
+                    return new WP_Error( 'invalid_input', __( '"find" mag niet leeg zijn.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                }
+                $replace   = isset( $input['replace'] ) ? (string) $input['replace'] : '';
+                $original  = (string) $post->post_content;
+                $count     = 0;
+                $use_regex = isset( $input['regex'] ) && filter_var( $input['regex'], FILTER_VALIDATE_BOOLEAN );
+
+                if ( $use_regex ) {
+                    $pattern = '~' . str_replace( '~', '\~', $find ) . '~u';
+                    $new     = preg_replace( $pattern, $replace, $original, -1, $count );
+                    if ( null === $new ) {
+                        return new WP_Error( 'invalid_regex', __( 'Ongeldig regex-patroon.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                    }
+                } else {
+                    $new = str_replace( $find, $replace, $original, $count );
+                }
+
+                if ( 0 === $count ) {
+                    return array( 'id' => (int) $post->ID, 'replacements' => 0, 'status' => 'geen overeenkomsten gevonden' );
+                }
+
+                $result = wp_update_post( array( 'ID' => $post->ID, 'post_content' => $new ), true );
+                if ( is_wp_error( $result ) ) {
+                    return $result;
+                }
+                return array(
+                    'id'           => (int) $post->ID,
+                    'replacements' => (int) $count,
+                    'status'       => 'bijgewerkt',
+                    'link'         => (string) get_permalink( $post->ID ),
+                );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- MEDIA: afbeelding uploaden ---------------------------------- */
+    wp_register_ability(
+        'jkc/upload-media',
+        array(
+            'label'         => __( 'Upload Media', 'jkc-mcp' ),
+            'description'   => __( 'Uploads an image to the WordPress media library, either from a remote URL ("url") or from base64 data ("base64" + "filename"). Optionally sets title and alt text. Returns media id, URL, mime type and title. Allowed formats follow the WordPress upload settings (typically jpg, png, webp, gif).', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'url'      => array( 'type' => 'string', 'description' => 'Bron-URL van de afbeelding om te downloaden.' ),
+                    'base64'   => array( 'type' => 'string', 'description' => 'Base64-gecodeerde afbeeldingsdata (alternatief voor url). Mag een data: URI zijn.' ),
+                    'filename' => array( 'type' => 'string', 'description' => 'Bestandsnaam incl. extensie (verplicht bij base64, optioneel bij url).' ),
+                    'title'    => array( 'type' => 'string', 'description' => 'Titel van de media (optioneel).' ),
+                    'alt'      => array( 'type' => 'string', 'description' => 'Alt-tekst (optioneel).' ),
+                ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                if ( ! current_user_can( 'upload_files' ) ) {
+                    return new WP_Error( 'forbidden', __( 'Geen rechten om media te uploaden.', 'jkc-mcp' ), array( 'status' => 403 ) );
+                }
+                require_once ABSPATH . 'wp-admin/includes/file.php';
+                require_once ABSPATH . 'wp-admin/includes/media.php';
+                require_once ABSPATH . 'wp-admin/includes/image.php';
+
+                $attachment_id = 0;
+                $title         = isset( $input['title'] ) ? sanitize_text_field( $input['title'] ) : null;
+
+                if ( ! empty( $input['url'] ) ) {
+                    $url = esc_url_raw( trim( (string) $input['url'] ) );
+                    if ( '' === $url ) {
+                        return new WP_Error( 'invalid_input', __( 'Ongeldige url.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                    }
+                    $tmp = download_url( $url, 30 );
+                    if ( is_wp_error( $tmp ) ) {
+                        return $tmp;
+                    }
+                    $name = ! empty( $input['filename'] ) ? sanitize_file_name( $input['filename'] ) : sanitize_file_name( basename( (string) wp_parse_url( $url, PHP_URL_PATH ) ) );
+                    if ( '' === $name ) {
+                        $name = 'upload.jpg';
+                    }
+                    $file_array    = array( 'name' => $name, 'tmp_name' => $tmp );
+                    $attachment_id = media_handle_sideload( $file_array, 0, $title );
+                    if ( is_wp_error( $attachment_id ) ) {
+                        if ( file_exists( $tmp ) ) {
+                            wp_delete_file( $tmp );
+                        }
+                        return $attachment_id;
+                    }
+                } elseif ( ! empty( $input['base64'] ) ) {
+                    if ( empty( $input['filename'] ) ) {
+                        return new WP_Error( 'invalid_input', __( 'filename is verplicht bij base64.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                    }
+                    $data = base64_decode( preg_replace( '#^data:[^;]+;base64,#', '', (string) $input['base64'] ), true );
+                    if ( false === $data ) {
+                        return new WP_Error( 'invalid_input', __( 'Ongeldige base64-data.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                    }
+                    $name   = sanitize_file_name( $input['filename'] );
+                    $upload = wp_upload_bits( $name, null, $data );
+                    if ( ! empty( $upload['error'] ) ) {
+                        return new WP_Error( 'upload_failed', $upload['error'], array( 'status' => 400 ) );
+                    }
+                    $filetype = wp_check_filetype( $upload['file'] );
+                    if ( empty( $filetype['type'] ) ) {
+                        wp_delete_file( $upload['file'] );
+                        return new WP_Error( 'invalid_type', __( 'Niet-ondersteund bestandstype.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                    }
+                    $attachment_id = wp_insert_attachment(
+                        array(
+                            'post_mime_type' => $filetype['type'],
+                            'post_title'     => $title ? $title : preg_replace( '/\.[^.]+$/', '', $name ),
+                            'post_content'   => '',
+                            'post_status'    => 'inherit',
+                        ),
+                        $upload['file']
+                    );
+                    if ( is_wp_error( $attachment_id ) ) {
+                        return $attachment_id;
+                    }
+                    wp_update_attachment_metadata( $attachment_id, wp_generate_attachment_metadata( $attachment_id, $upload['file'] ) );
+                } else {
+                    return new WP_Error( 'invalid_input', __( 'Geef een url of base64 + filename op.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                }
+
+                if ( isset( $input['alt'] ) ) {
+                    update_post_meta( $attachment_id, '_wp_attachment_image_alt', sanitize_text_field( $input['alt'] ) );
+                }
+
+                return array(
+                    'id'        => (int) $attachment_id,
+                    'url'       => (string) wp_get_attachment_url( $attachment_id ),
+                    'mime_type' => (string) get_post_mime_type( $attachment_id ),
+                    'title'     => get_the_title( $attachment_id ),
+                    'alt'       => (string) get_post_meta( $attachment_id, '_wp_attachment_image_alt', true ),
+                );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'upload_files' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- MEDIA: uitgelichte afbeelding instellen --------------------- */
+    wp_register_ability(
+        'jkc/set-featured-image',
+        array(
+            'label'         => __( 'Set Featured Image', 'jkc-mcp' ),
+            'description'   => __( 'Sets the featured image of a page, post (or WooCommerce product) by media attachment id. Pass attachment_id 0 to remove the featured image.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'slug'          => array( 'type' => 'string', 'description' => 'The slug (or use id).' ),
+                    'id'            => array( 'type' => 'integer', 'description' => 'The content ID (or use slug). For products use the product id.' ),
+                    'type'          => $type_prop,
+                    'attachment_id' => array( 'type' => 'integer', 'description' => 'Media-ID van de afbeelding (0 = uitgelichte afbeelding verwijderen).' ),
+                ),
+                'required'   => array( 'attachment_id' ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                // Resolve doel: sta naast de standaard types ook 'product' toe (op id).
+                $post  = null;
+                $types = jkc_mcp_allowed_types();
+                if ( function_exists( 'wc_get_product' ) ) {
+                    $types[] = 'product';
+                }
+                if ( ! empty( $input['id'] ) ) {
+                    $p = get_post( (int) $input['id'] );
+                    if ( $p && in_array( $p->post_type, $types, true ) ) {
+                        $post = $p;
+                    }
+                }
+                if ( ! $post ) {
+                    $post = jkc_mcp_resolve_post( $input );
+                    if ( is_wp_error( $post ) ) {
+                        return $post;
+                    }
+                }
+                if ( ! current_user_can( 'edit_post', $post->ID ) ) {
+                    return new WP_Error( 'forbidden', __( 'You cannot edit this content.', 'jkc-mcp' ), array( 'status' => 403 ) );
+                }
+
+                $attachment_id = (int) ( $input['attachment_id'] ?? 0 );
+                if ( 0 === $attachment_id ) {
+                    delete_post_thumbnail( $post->ID );
+                    return array( 'id' => (int) $post->ID, 'featured_image_id' => 0, 'status' => 'verwijderd' );
+                }
+
+                $att = get_post( $attachment_id );
+                if ( ! $att || 'attachment' !== $att->post_type ) {
+                    return new WP_Error( 'invalid_media', __( 'Ongeldige media-ID.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                }
+                $ok = set_post_thumbnail( $post->ID, $attachment_id );
+                if ( ! $ok ) {
+                    return new WP_Error( 'failed', __( 'Kon de uitgelichte afbeelding niet instellen.', 'jkc-mcp' ), array( 'status' => 500 ) );
+                }
+                return array(
+                    'id'                => (int) $post->ID,
+                    'featured_image_id' => $attachment_id,
+                    'featured_image'    => (string) wp_get_attachment_image_url( $attachment_id, 'full' ),
+                    'status'            => 'ingesteld',
+                );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'edit_pages' ) || current_user_can( 'edit_posts' ) || current_user_can( 'edit_products' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- MEDIA: alt-tekst bijwerken (alias van set-image-alt) -------- */
+    wp_register_ability(
+        'jkc/update-image-alt',
+        array(
+            'label'         => __( 'Update Image Alt', 'jkc-mcp' ),
+            'description'   => __( 'Update the alt text of a media library image by attachment id, without touching other media metadata. Functionally identical to set-image-alt.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array( 'type' => 'object', 'properties' => array( 'attachment_id' => array( 'type' => 'integer' ), 'alt' => array( 'type' => 'string' ) ), 'required' => array( 'attachment_id', 'alt' ) ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                return jkc_mcp_set_attachment_alt( (int) ( $input['attachment_id'] ?? 0 ), (string) ( $input['alt'] ?? '' ) );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'upload_files' ) || current_user_can( 'edit_pages' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
     /* ---- WOOCOMMERCE (alleen als WooCommerce actief is) -------------- */
     if ( function_exists( 'wc_get_product' ) ) {
 
@@ -1908,6 +2620,185 @@ function jkc_mcp_register_abilities() {
                 'permission_callback' => function () {
                     return current_user_can( 'manage_woocommerce' );
                 },
+                'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        /* ---- WooCommerce: productcategorieën ------------------------- */
+        $jkc_wc_cat_read_cap  = function () {
+            return current_user_can( 'manage_woocommerce' ) || current_user_can( 'edit_products' ) || current_user_can( 'manage_product_terms' );
+        };
+        $jkc_wc_cat_write_cap = function () {
+            return current_user_can( 'manage_woocommerce' ) || current_user_can( 'edit_products' ) || current_user_can( 'manage_product_terms' ) || current_user_can( 'manage_categories' );
+        };
+
+        wp_register_ability(
+            'jkc/wc-find-categories',
+            array(
+                'label'         => __( 'WooCommerce: Find Categories', 'jkc-mcp' ),
+                'description'   => __( 'List WooCommerce product categories with id, name, slug, parent and product count. Category pages typically rank for the most valuable generic keywords. Optional search term.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'search' => array( 'type' => 'string' ), 'limit' => array( 'type' => 'integer' ) ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $args = array(
+                        'taxonomy'   => 'product_cat',
+                        'hide_empty' => false,
+                        'number'     => isset( $input['limit'] ) ? max( 1, min( (int) $input['limit'], 300 ) ) : 100,
+                        'orderby'    => 'name',
+                        'order'      => 'ASC',
+                    );
+                    if ( ! empty( $input['search'] ) ) {
+                        $args['search'] = sanitize_text_field( $input['search'] );
+                    }
+                    $terms = get_terms( $args );
+                    if ( is_wp_error( $terms ) ) {
+                        return $terms;
+                    }
+                    $out = array();
+                    foreach ( $terms as $t ) {
+                        $link  = get_term_link( $t );
+                        $out[] = array(
+                            'id'            => (int) $t->term_id,
+                            'name'          => $t->name,
+                            'slug'          => $t->slug,
+                            'parent'        => (int) $t->parent,
+                            'product_count' => (int) $t->count,
+                            'link'          => is_wp_error( $link ) ? '' : (string) $link,
+                        );
+                    }
+                    return array( 'count' => count( $out ), 'categories' => $out );
+                },
+                'permission_callback' => $jkc_wc_cat_read_cap,
+                'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        wp_register_ability(
+            'jkc/wc-get-category',
+            array(
+                'label'         => __( 'WooCommerce: Get Category', 'jkc-mcp' ),
+                'description'   => __( 'Get a product category by id or slug: name, slug, description, parent, product count and Yoast SEO fields (seo_title, meta_description, focus_keyphrase).', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array( 'type' => 'object', 'properties' => array( 'id' => array( 'type' => 'integer' ), 'slug' => array( 'type' => 'string' ) ) ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    $term = jkc_mcp_resolve_term( $input, 'product_cat' );
+                    if ( is_wp_error( $term ) ) {
+                        return array( 'error' => true, 'message' => 'Categorie niet gevonden.' );
+                    }
+                    $yoast = jkc_mcp_get_term_yoast( 'product_cat', $term->term_id );
+                    $link  = get_term_link( $term );
+                    return array(
+                        'id'               => (int) $term->term_id,
+                        'name'             => $term->name,
+                        'slug'             => $term->slug,
+                        'parent'           => (int) $term->parent,
+                        'description'      => $term->description,
+                        'product_count'    => (int) $term->count,
+                        'link'             => is_wp_error( $link ) ? '' : (string) $link,
+                        'seo_title'        => $yoast['seo_title'],
+                        'meta_description' => $yoast['meta_description'],
+                        'focus_keyphrase'  => $yoast['focus_keyphrase'],
+                    );
+                },
+                'permission_callback' => $jkc_wc_cat_read_cap,
+                'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        wp_register_ability(
+            'jkc/wc-update-category',
+            array(
+                'label'         => __( 'WooCommerce: Update Category', 'jkc-mcp' ),
+                'description'   => __( 'Update a product category description (and optionally its name) by id or slug. Show the new text and get approval before calling.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array(
+                    'type'       => 'object',
+                    'properties' => array(
+                        'id'          => array( 'type' => 'integer' ),
+                        'slug'        => array( 'type' => 'string' ),
+                        'name'        => array( 'type' => 'string', 'description' => 'Nieuwe naam (optioneel).' ),
+                        'description' => array( 'type' => 'string', 'description' => 'Nieuwe beschrijving (HTML toegestaan).' ),
+                    ),
+                ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    if ( ! current_user_can( 'manage_woocommerce' ) && ! current_user_can( 'edit_products' ) && ! current_user_can( 'manage_product_terms' ) && ! current_user_can( 'manage_categories' ) ) {
+                        return array( 'error' => true, 'message' => 'Geen rechten.' );
+                    }
+                    $term = jkc_mcp_resolve_term( $input, 'product_cat' );
+                    if ( is_wp_error( $term ) ) {
+                        return array( 'error' => true, 'message' => 'Categorie niet gevonden.' );
+                    }
+                    $args = array();
+                    if ( isset( $input['name'] ) ) {
+                        $args['name'] = sanitize_text_field( $input['name'] );
+                    }
+                    if ( isset( $input['description'] ) ) {
+                        $args['description'] = wp_kses_post( $input['description'] );
+                    }
+                    if ( empty( $args ) ) {
+                        return array( 'error' => true, 'message' => 'Niets om bij te werken (geef name en/of description).' );
+                    }
+                    $res = wp_update_term( $term->term_id, 'product_cat', $args );
+                    if ( is_wp_error( $res ) ) {
+                        return $res;
+                    }
+                    $term = get_term( $term->term_id, 'product_cat' );
+                    return array(
+                        'id'          => (int) $term->term_id,
+                        'name'        => $term->name,
+                        'slug'        => $term->slug,
+                        'description' => $term->description,
+                        'result'      => 'bijgewerkt',
+                    );
+                },
+                'permission_callback' => $jkc_wc_cat_write_cap,
+                'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
+            )
+        );
+
+        wp_register_ability(
+            'jkc/wc-update-category-seo',
+            array(
+                'label'         => __( 'WooCommerce: Update Category SEO', 'jkc-mcp' ),
+                'description'   => __( 'Set the Yoast SEO title, meta description and/or focus keyphrase on a WooCommerce product category (taxonomy term), by id or slug. Uses the same Yoast conventions as page/post SEO.', 'jkc-mcp' ),
+                'category'      => 'jkc-content',
+                'input_schema'  => array(
+                    'type'       => 'object',
+                    'properties' => array(
+                        'id'               => array( 'type' => 'integer' ),
+                        'slug'             => array( 'type' => 'string' ),
+                        'seo_title'        => array( 'type' => 'string', 'description' => 'Yoast SEO-titel (optioneel).' ),
+                        'meta_description' => array( 'type' => 'string', 'description' => 'Yoast meta description (optioneel).' ),
+                        'focus_keyphrase'  => array( 'type' => 'string', 'description' => 'Yoast focus keyphrase (optioneel).' ),
+                    ),
+                ),
+                'output_schema' => array( 'type' => 'object' ),
+                'execute_callback'    => function ( array $input ) {
+                    if ( ! current_user_can( 'manage_woocommerce' ) && ! current_user_can( 'edit_products' ) && ! current_user_can( 'manage_product_terms' ) && ! current_user_can( 'manage_categories' ) ) {
+                        return array( 'error' => true, 'message' => 'Geen rechten.' );
+                    }
+                    $term = jkc_mcp_resolve_term( $input, 'product_cat' );
+                    if ( is_wp_error( $term ) ) {
+                        return array( 'error' => true, 'message' => 'Categorie niet gevonden.' );
+                    }
+                    if ( ! isset( $input['seo_title'] ) && ! isset( $input['meta_description'] ) && ! isset( $input['focus_keyphrase'] ) ) {
+                        return array( 'error' => true, 'message' => 'Geef minstens één SEO-veld op.' );
+                    }
+                    $updated = jkc_mcp_set_term_yoast( 'product_cat', $term->term_id, $input );
+                    return array(
+                        'id'               => (int) $term->term_id,
+                        'name'             => $term->name,
+                        'slug'             => $term->slug,
+                        'seo_title'        => $updated['seo_title'],
+                        'meta_description' => $updated['meta_description'],
+                        'focus_keyphrase'  => $updated['focus_keyphrase'],
+                        'result'           => 'bijgewerkt',
+                    );
+                },
+                'permission_callback' => $jkc_wc_cat_write_cap,
                 'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true ), 'mcp' => array( 'public' => true ) ),
             )
         );
