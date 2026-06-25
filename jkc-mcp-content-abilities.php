@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       JKC MCP Content Abilities
  * Description:       Stelt lees- en schrijf-abilities (pagina's, berichten, Yoast SEO, volledige SEO-audit) beschikbaar aan de WordPress MCP Adapter, zodat AI-assistenten zoals Claude content op deze site kunnen lezen, auditen en bewerken. Maakt bij activatie automatisch een Claude-gebruiker met applicatie-wachtwoord aan. Werkt op elke WordPress-site.
- * Version:           1.11.0
+ * Version:           1.12.0
  * Requires PHP:      7.4
  * Author:            JKC Media
  * License:           GPL-2.0-or-later
@@ -2119,6 +2119,102 @@ function jkc_mcp_register_abilities() {
                 return current_user_can( 'upload_files' );
             },
             'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
+        )
+    );
+
+    /* ---- MEDIA: mediabibliotheek doorzoeken -------------------------- */
+    wp_register_ability(
+        'jkc/get-media-library',
+        array(
+            'label'         => __( 'Get Media Library', 'jkc-mcp' ),
+            'description'   => __( 'Searches the WordPress media library for images by keyword, matching against the filename, media title and alt text. Returns a list of images with their attachment_id (directly usable in jkc/set-featured-image), filename, public URL, alt text and title. Use this to find an existing image to attach to a post instead of uploading a new one.', 'jkc-mcp' ),
+            'category'      => 'jkc-content',
+            'input_schema'  => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'search' => array( 'type' => 'string', 'description' => 'Zoekterm om te filteren op bestandsnaam, titel of alt-tekst in de mediabibliotheek.' ),
+                    'limit'  => array( 'type' => 'integer', 'description' => 'Maximaal aantal resultaten (standaard 10).' ),
+                ),
+                'required'   => array( 'search' ),
+            ),
+            'output_schema' => array( 'type' => 'object' ),
+            'execute_callback'    => function ( array $input ) {
+                if ( ! current_user_can( 'upload_files' ) ) {
+                    return new WP_Error( 'forbidden', __( 'Geen rechten om de mediabibliotheek te bekijken.', 'jkc-mcp' ), array( 'status' => 403 ) );
+                }
+
+                $search = isset( $input['search'] ) ? trim( (string) $input['search'] ) : '';
+                if ( '' === $search ) {
+                    return new WP_Error( 'invalid_input', __( 'search is verplicht.', 'jkc-mcp' ), array( 'status' => 400 ) );
+                }
+
+                $limit = isset( $input['limit'] ) ? (int) $input['limit'] : 10;
+                if ( $limit < 1 ) {
+                    $limit = 10;
+                }
+                if ( $limit > 100 ) {
+                    $limit = 100;
+                }
+
+                $base = array(
+                    'post_type'      => 'attachment',
+                    'post_status'    => 'inherit',
+                    'post_mime_type' => 'image',
+                    'fields'         => 'ids',
+                    'posts_per_page' => $limit,
+                    'orderby'        => 'date',
+                    'order'          => 'DESC',
+                    'no_found_rows'  => true,
+                );
+
+                // WP_Query 's' doorzoekt titel/inhoud; alt en bestandsnaam staan in meta.
+                // Drie losse queries op OR-basis, daarna uniek samenvoegen.
+                $ids = array();
+
+                $by_title = get_posts( array_merge( $base, array( 's' => $search ) ) );
+
+                $by_meta = get_posts(
+                    array_merge(
+                        $base,
+                        array(
+                            'meta_query' => array(
+                                'relation' => 'OR',
+                                array( 'key' => '_wp_attachment_image_alt', 'value' => $search, 'compare' => 'LIKE' ),
+                                array( 'key' => '_wp_attached_file', 'value' => $search, 'compare' => 'LIKE' ),
+                            ),
+                        )
+                    )
+                );
+
+                foreach ( array_merge( (array) $by_title, (array) $by_meta ) as $id ) {
+                    $ids[ (int) $id ] = (int) $id;
+                    if ( count( $ids ) >= $limit ) {
+                        break;
+                    }
+                }
+
+                $images = array();
+                foreach ( $ids as $id ) {
+                    $file = get_post_meta( $id, '_wp_attached_file', true );
+                    $images[] = array(
+                        'attachment_id' => $id,
+                        'filename'      => $file ? basename( (string) $file ) : basename( (string) wp_get_attachment_url( $id ) ),
+                        'url'           => (string) wp_get_attachment_url( $id ),
+                        'alt'           => (string) get_post_meta( $id, '_wp_attachment_image_alt', true ),
+                        'title'         => get_the_title( $id ),
+                    );
+                }
+
+                return array(
+                    'search'  => $search,
+                    'count'   => count( $images ),
+                    'results' => $images,
+                );
+            },
+            'permission_callback' => function () {
+                return current_user_can( 'upload_files' );
+            },
+            'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false ), 'mcp' => array( 'public' => true ) ),
         )
     );
 
